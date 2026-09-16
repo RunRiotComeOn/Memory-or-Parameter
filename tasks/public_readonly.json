@@ -1,0 +1,51 @@
+[
+  {
+    "id": "wiki_ada_birth",
+    "instruction": "Using Wikipedia, find Ada Lovelace's date of birth and report it.",
+    "start_url": "https://en.wikipedia.org/wiki/Main_Page",
+    "answer_patterns": ["(10 December 1815|December 10, 1815)"]
+  },
+  {
+    "id": "wiki_turing_birthplace",
+    "instruction": "Using Wikipedia, find Alan Turing's birthplace and report it.",
+    "start_url": "https://en.wikipedia.org/wiki/Main_Page",
+    "answer_patterns": ["Maida Vale"]
+  },
+  {
+    "id": "wiki_hopper_award",
+    "instruction": "Using Wikipedia, find the year Grace Hopper received the National Medal of Technology and report the year.",
+    "start_url": "https://en.wikipedia.org/wiki/Main_Page",
+    "answer_patterns": ["1991"]
+  },
+  {
+    "id": "wiki_knuth_birthplace",
+    "instruction": "Using Wikipedia, find Donald Knuth's birthplace and report it.",
+    "start_url": "https://en.wikipedia.org/wiki/Main_Page",
+    "answer_patterns": ["Milwaukee"]
+  },
+  {
+    "id": "wiki_liskov_birthplace",
+    "instruction": "Using Wikipedia, find Barbara Liskov's birthplace and report it.",
+    "start_url": "https://en.wikipedia.org/wiki/Main_Page",
+    "answer_patterns": ["Los Angeles"]
+  },
+  {
+    "id": "wiki_dijkstra_birthplace",
+    "instruction": "Using Wikipedia, find Edsger Dijkstra's birthplace and report it.",
+    "start_url": "https://en.wikipedia.org/wiki/Main_Page",
+    "answer_patterns": ["Rotterdam"]
+  },
+  {
+    "id": "webarena_license",
+    "instruction": "On the WebArena GitHub repository page, identify the repository's software license and report it.",
+    "start_url": "https://github.com/web-arena-x/webarena",
+    "answer_patterns": ["Apache(-| )?2(\\.0)?"]
+  },
+  {
+    "id": "qwen35_license",
+    "instruction": "On the Qwen3.5-35B-A3B Hugging Face model page, identify the model license and report it.",
+    "start_url": "https://huggingface.co/Qwen/Qwen3.5-35B-A3B",
+    "answer_patterns": ["Apache(-| )?2(\\.0)?"]
+  }
+]
+

@@ -1,0 +1,33 @@
+# Virtual environments
+.venv/
+.train-venv/
+.megatron-venv/
+.verl-venv/
+.timewarp-env/
+.tau-uv-venv/
+.cuda-toolkit/
+
+# Vendored / third-party code (not ours to version here)
+third_party/
+upstream_webarena/
+
+# Python / tooling caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Experiment outputs, logs, checkpoints, trajectory data -- large, regenerable,
+# not source. Design docs are the exception (see negation below).
+training/
+runs/
+runs_action_sft/
+runtime_logs/
+outputs/
+replay_runs/
+appworld_experiment/
+tau_experiment/
+timewarp_*/
+router_reward_v1/*
+!router_reward_v1/DESIGN.md

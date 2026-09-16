@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "operations": {
+      "type": "array",
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "op": {"type": "string", "enum": ["add", "refine", "replace"]},
+          "target_memory_id": {"type": ["string", "null"]},
+          "memory": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "content": {"type": "string"},
+              "scope": {"type": "string"},
+              "evidence_steps": {"type": "array", "items": {"type": "integer"}},
+              "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+            },
+            "required": ["content", "scope", "evidence_steps", "confidence"]
+          }
+        },
+        "required": ["op", "target_memory_id", "memory"]
+      }
+    },
+    "call_assessment": {"type": "string"}
+  },
+  "required": ["operations", "call_assessment"]
+}

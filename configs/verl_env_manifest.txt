@@ -1,0 +1,22 @@
+# Qwen3.5-35B-A3B SFT environment, prepared 2026-08-07.
+# Activate with: source scripts/activate_verl.sh
+
+python==3.11.14
+torch==2.8.0+cu128
+torchvision==0.23.0
+torchaudio==2.8.0
+transformers==5.7.0
+verl==0.9.0.dev0
+verl_git_commit==2b0fe5158be73b30e749f5c63c1c3b6d5db5d614
+veomni==0.1.10
+flash-attn==2.8.3+cu12torch2.8cxx11abiTRUE
+flash-linear-attention==0.4.1
+fla-core==0.4.1
+causal-conv1d==1.6.2.post1
+ray==2.56.1
+tensordict==0.10.0
+peft==0.18.1
+datasets==2.21.0
+accelerate==1.12.0
+triton==3.4.0
+numpy==2.4.6

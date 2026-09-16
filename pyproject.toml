@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trajectory-memory-lab"
+version = "0.1.0"
+description = "A WebArena-style experiment for autonomous reusable memory and SFT QA selection."
+requires-python = ">=3.10"
+dependencies = [
+  "openai>=2.0",
+  "playwright>=1.52,<2",
+]
+
+[project.scripts]
+trajectory-memory-lab = "trajectory_memory_lab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
