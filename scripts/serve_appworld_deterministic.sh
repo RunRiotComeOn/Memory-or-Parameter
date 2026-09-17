@@ -26,13 +26,18 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/appworld-det-server-cache}"
 # Only needed if the probe shows the server is still nondeterministic at
 # batch size 1 (MoE expert GEMMs can accumulate with atomics).
 
+# PORT / TENSOR_PARALLEL_SIZE / GPU_MEMORY_UTILIZATION / MAX_MODEL_LEN are
+# overridable so several replicas can run side by side (DESIGN.md section 11:
+# determinism comes from --max-num-seqs 1 within a replica, so independent
+# replicas parallelize without affecting it). Defaults are the original
+# single-replica TP=4 settings.
 exec "$project_root/.venv/bin/vllm" serve "$model_path" \
   --served-model-name qwen35-tau \
   --host 127.0.0.1 \
-  --port 8000 \
-  --tensor-parallel-size 4 \
-  --max-model-len 65536 \
-  --gpu-memory-utilization 0.88 \
+  --port "${PORT:-8000}" \
+  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE:-4}" \
+  --max-model-len "${MAX_MODEL_LEN:-65536}" \
+  --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.88}" \
   --enforce-eager \
   --max-num-seqs 1 \
   --no-enable-prefix-caching \

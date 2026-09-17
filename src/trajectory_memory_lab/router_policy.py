@@ -63,6 +63,17 @@ class RouterPolicy(nn.Module):
         return self.linear(features)
 
 
+def action_distribution(model: RouterPolicy, features: torch.Tensor) -> Categorical:
+    """The full 4-way policy distribution at this state.
+
+    Exposed separately from `sample_action` so callers can inspect the whole
+    distribution -- specifically `.entropy()` for the entropy-regularization
+    term and the collapse diagnostics. Built from logits (not probs) so the
+    entropy/log_prob computations stay in log-space and numerically stable.
+    """
+    return Categorical(logits=model(features))
+
+
 def greedy_action(model: RouterPolicy, features: torch.Tensor) -> str:
     """Argmax route -- what deployment/validation actually runs, no exploration."""
     with torch.no_grad():
@@ -71,13 +82,22 @@ def greedy_action(model: RouterPolicy, features: torch.Tensor) -> str:
     return ROUTES[index]
 
 
-def sample_action(model: RouterPolicy, features: torch.Tensor) -> tuple[str, torch.Tensor]:
-    """Stochastic sample (not argmax) -- exploration is required for GRPO."""
-    logits = model(features)
-    dist = Categorical(logits=logits)
+def sample_action(
+    model: RouterPolicy, features: torch.Tensor
+) -> tuple[str, torch.Tensor, Categorical]:
+    """Stochastic sample (not argmax) -- exploration is required for GRPO.
+
+    Returns the sampled route, its logprob, and the full distribution it was
+    drawn from. The distribution is returned (rather than just the entropy)
+    because it carries the whole policy at this state: `.entropy()` feeds the
+    entropy bonus in the training loss, `.probs` feeds the per-route
+    diagnostics that tell us whether the route distribution is collapsing.
+    Both stay attached to the graph, so the entropy term is differentiable.
+    """
+    dist = action_distribution(model, features)
     index = dist.sample()
     logprob = dist.log_prob(index)
-    return ROUTES[int(index.item())], logprob
+    return ROUTES[int(index.item())], logprob, dist
 
 
 @dataclass

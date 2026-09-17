@@ -61,7 +61,7 @@ GROUP = "appworld"
 TRAIN_ROLLOUT = ROOT / "appworld_experiment/base_train_v2"
 PROBE_BASELINE_ROLLOUT = ROOT / "appworld_experiment/noise_serial_v1/run_a"
 PROBE_SET_SIZE = 15  # only used for the end-of-iteration validation split now, not training
-OUTPUT_ROOT = ROOT / "router_reward_v1/cheap_train_v3"
+OUTPUT_ROOT = ROOT / "router_reward_v1/cheap_train_v4"
 CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
 TRAIN_LOG = OUTPUT_ROOT / "train_log.jsonl"
 
@@ -169,7 +169,7 @@ def sample_k_candidates(
         torch.manual_seed(20260822 + iteration * 100_000 + batch_idx * 1000 + k)
         cand_dir = OUTPUT_ROOT / f"iter{iteration}" / f"b{batch_idx}" / f"k{k}"
         builder_config = RouterBuilderConfig(
-            output=cand_dir, record_protocol="cheap_reward_v3_decision",
+            output=cand_dir, record_protocol="cheap_reward_v4_decision",
             model=args.model, base_url=args.base_url, seed=20260822 + k,
         )
         result = run_router_chain(
@@ -196,7 +196,7 @@ def score_candidates_self_only(candidates: list[dict[str, Any]], batch_task_ids:
         for cand, base_url in zip(pair, replicas):
             bank_path = cand["dir"] / "banks" / f"memory_{GROUP}.json"
             self_dir = cand["dir"] / "eval_self"
-            tag = f"cheap_v3_iter{iteration}_b{batch_idx}_k{cand['k']}_self"
+            tag = f"cheap_v4_iter{iteration}_b{batch_idx}_k{cand['k']}_self"
             procs.append((cand, self_dir, tag, launch_subset_eval(bank_path, self_dir, tag, batch_task_ids, "train", args.model, base_url)))
         for cand, self_dir, tag, proc in procs:
             cand["self_pass_rate"] = wait_subset_eval(proc, self_dir, tag)
@@ -209,14 +209,21 @@ def run_validation_pass(router_model: RouterPolicy, iteration: int, task_ids: li
     docstring: this run never scores anything against the probe set."""
     val_dir = OUTPUT_ROOT / f"iter{iteration}" / "validation"
     builder_config = RouterBuilderConfig(
-        output=val_dir, record_protocol="cheap_reward_v3_validation",
+        output=val_dir, record_protocol="cheap_reward_v4_validation",
         model=args.model, base_url=args.base_url, seed=20260822,
     )
     result = run_router_chain(router_model, GROUP, task_ids, trajectories, builder_config, greedy=True)
     route_counts = Counter(d["route"] for d in result.decisions)
+    # route_counts here is over argmax routes, which hides a collapsing policy
+    # until it has already fully collapsed; the mean entropy of the underlying
+    # distribution is the early warning.
+    mean_entropy = (
+        float(sum(float(d["entropy"]) for d in result.decisions) / len(result.decisions))
+        if result.decisions else 0.0
+    )
     bank_path = val_dir / "banks" / f"memory_{GROUP}.json"
     eval_dir = val_dir / "eval_full_dev"
-    proc = launch_subset_eval(bank_path, eval_dir, f"cheap_v3_iter{iteration}_validation", None, "dev", args.model, args.base_url)
+    proc = launch_subset_eval(bank_path, eval_dir, f"cheap_v4_iter{iteration}_validation", None, "dev", args.model, args.base_url)
     pass_rate = wait_subset_eval(proc, eval_dir, "validation")
 
     probe_set = set(probe_task_ids)
@@ -234,12 +241,14 @@ def run_validation_pass(router_model: RouterPolicy, iteration: int, task_ids: li
     held_out_pass_rate = held_out_successes / held_out_total if held_out_total else None
 
     print(
-        f"[iter{iteration} validation] routes={dict(route_counts)} active_entries={result.summary['active_entries']} "
+        f"[iter{iteration} validation] routes={dict(route_counts)} mean_entropy={mean_entropy:.4f} "
+        f"active_entries={result.summary['active_entries']} "
         f"full_dev_pass_rate={pass_rate:.4f} probe_subset(15)={probe_subset_pass_rate} held_out(42)={held_out_pass_rate}",
         flush=True,
     )
     return {
-        "route_counts": dict(route_counts), "active_entries": result.summary["active_entries"],
+        "route_counts": dict(route_counts), "mean_entropy": mean_entropy,
+        "active_entries": result.summary["active_entries"],
         "full_dev_pass_rate": pass_rate, "probe_subset_pass_rate": probe_subset_pass_rate,
         "held_out_pass_rate": held_out_pass_rate,
     }
@@ -263,18 +272,34 @@ def run_one_batch_update(
     advantages = [r - mean_reward for r in rewards]
 
     optimizer.zero_grad()
-    loss = torch.zeros(())
+    # Policy-gradient term summed over every decision in every candidate, plus an
+    # entropy bonus over the same decisions so the two terms share a scale (both
+    # grow with K x batch_size). Without it the router collapses to a
+    # near-deterministic route well before the reward signal has said anything
+    # useful -- v2 ended up greedy-`both` on all 90 decisions and v3_g4's sampled
+    # entropy fell from 1.14 to 0.65 nats over 9 batches. Subtracting
+    # entropy_coef * H rewards keeping mass on the other routes, so exploration
+    # survives long enough for the (small, noisy) advantages to matter.
+    pg_term = torch.zeros(())
+    entropy_sum = torch.zeros(())
+    decision_count = 0
     for advantage, cand in zip(advantages, candidates):
         for decision in cand["decisions"]:
-            loss = loss - advantage * decision["logprob"]
+            pg_term = pg_term - advantage * decision["logprob"]
+            entropy_sum = entropy_sum + decision["entropy"]
+            decision_count += 1
+    loss = pg_term - args.entropy_coef * entropy_sum
     loss.backward()
     optimizer.step()
+
+    mean_entropy = float(entropy_sum.item() / decision_count) if decision_count else 0.0
 
     chosen = random.choice(candidates)
     print(
         f"[iter{iteration} b{batch_idx}] self_pass_rates={[round(c['self_pass_rate'],3) for c in candidates]} "
         f"self_baseline={self_baseline:.3f} rewards={[round(r,3) for r in rewards]} advantages={[round(a,3) for a in advantages]} "
-        f"loss={loss.item():.4f} chosen_k={chosen['k']} chosen_self_pass_rate={chosen['self_pass_rate']:.4f}",
+        f"loss={loss.item():.4f} pg_term={pg_term.item():.4f} mean_entropy={mean_entropy:.4f} "
+        f"chosen_k={chosen['k']} chosen_self_pass_rate={chosen['self_pass_rate']:.4f}",
         flush=True,
     )
 
@@ -287,6 +312,9 @@ def run_one_batch_update(
         "rewards": rewards,
         "advantages": advantages,
         "loss": loss.item(),
+        "pg_term": pg_term.item(),
+        "mean_entropy": mean_entropy,
+        "entropy_coef": args.entropy_coef,
         "chosen_k": chosen["k"],
     }
     TRAIN_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -301,7 +329,13 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--rollouts-per-batch", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=0.05)
+    parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument(
+        "--entropy-coef", type=float, default=0.01,
+        help="weight on the entropy bonus subtracted from the loss; 0 reproduces the "
+             "pre-v4 objective. Counteracts the route-distribution collapse seen in "
+             "cheap_train_v2/v3_g4 (see the v4 note in DESIGN.md).",
+    )
     parser.add_argument("--model", default="qwen35-tau")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--base-url-probe", default="http://127.0.0.1:8001/v1", help="second replica, used to parallelize self-evals across candidates now, not for a probe set")

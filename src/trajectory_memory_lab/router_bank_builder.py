@@ -48,7 +48,13 @@ from .alloc_writer_harness import (
     writes_sft,
 )
 from .model_client import ModelClient
-from .router_policy import RouterPolicy, features_of, greedy_action, sample_action
+from .router_policy import (
+    RouterPolicy,
+    action_distribution,
+    features_of,
+    greedy_action,
+    sample_action,
+)
 from .writer_rubrics import routed_writer_system
 
 
@@ -83,7 +89,8 @@ class RouterBuilderConfig:
 @dataclass
 class RouterChainResult:
     summary: dict[str, Any]
-    decisions: list[dict[str, Any]] = field(default_factory=list)  # {"logprob": Tensor, "route": str}
+    # {"logprob": Tensor, "route": str, "entropy": Tensor, "probs": Tensor}
+    decisions: list[dict[str, Any]] = field(default_factory=list)
     bank: list[dict[str, Any]] = field(default_factory=list)  # full bank incl. superseded, for chaining batches
 
 
@@ -136,9 +143,19 @@ def run_router_chain(
         features = features_of(trajectory, bank, position, domain_length)
         if greedy:
             route, logprob = greedy_action(router_model, features), torch.zeros(())
+            # No gradient here, but the distribution is still worth recording:
+            # it is how we see whether the *policy* has collapsed at validation
+            # time, which argmax alone cannot show.
+            with torch.no_grad():
+                dist = action_distribution(router_model, features)
+                entropy, probs = dist.entropy(), dist.probs
         else:
-            route, logprob = sample_action(router_model, features)
-        live_decisions.append({"logprob": logprob, "route": route, "task_id": task_id, "group": group})
+            route, logprob, dist = sample_action(router_model, features)
+            entropy, probs = dist.entropy(), dist.probs
+        live_decisions.append({
+            "logprob": logprob, "route": route, "task_id": task_id, "group": group,
+            "entropy": entropy, "probs": probs,
+        })
 
         record_path = records_dir / f"{position:03d}_{task_id}.json"
         record: dict[str, Any]

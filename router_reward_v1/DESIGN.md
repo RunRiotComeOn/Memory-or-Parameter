@@ -341,3 +341,78 @@ iteration 1 跑完后发现的问题：一条链上 90 个路由决策共享同�
 superseded 条目）供下一段续用。`train_router_grpo.py` 重写为按 batch 收集 checkpoint、按 batch 位置
 算 advantage。跑真实 GPU 之前用 stub 掉 LLM 调用和 held-out 评测的合成测试验证过：bank 跨 batch 正确
 累积（active_entries 单调不降）、每条链的决策数之和等于 90、梯度能传、参数会变。
+
+## 12. Route 分布熵坍缩：加熵正则 + 降学习率（2026-09-16，v4）
+
+**现象**（此前几节都没记，补在这里）：`cheap_train_v2` / `cheap_train_v3_g4` 反复出现 route 分布坍缩。
+两种表现要分开看，因为它们出现的时间不一样：
+
+- **greedy（argmax）先坍**：v2 iteration 1 的 validation 是 `routes={'both': 90}`——90 个决策全走 `both`，
+  `memory`/`sft`/`neither` 一次都没被选中。v3_g4 是 `{'both': 57, 'sft': 33}`，同样只剩两个 route。
+- **采样分布后坍**：同一时刻 v2 的采样熵其实还有 ~1.0-1.3 nats（ln4 = 1.386 是上限），并没有真的坍到 0。
+  也就是说 argmax 已经完全退化的时候，底下的分布只是"排序稳定"、还没饱和。真正的熵坍缩在 v3_g4 才看得
+  清楚：9 个 batch 里 mean entropy 从 1.138 单调掉到 0.653。
+
+**教训**：只看 validation 的 `route_counts` 会晚一步——argmax 是个阶跃函数，排序一稳定它就全变成同一个
+route，但那时分布本身还有救。所以 v4 把**分布的熵**也记进日志（训练每个 batch 一条 `mean_entropy`，
+validation 也记一条），把它当早期预警，而不是等 `route_counts` 变成单一值才发现。
+
+**根因不止一个，而且主因不是"没有熵正则"**：advantage 的量级很小（实测 ±0.05 ~ ±0.3），但优化器是
+Adam——Adam 按梯度的 running second moment 做归一化，梯度再小，参数步长也还是 ~lr 量级。lr=0.05 作用在
+一个只有 24 个参数的线性模型上，9 步就足够把 bias 推到 logits 饱和。做了一次受控模拟（把 advantage 建模
+成正比于该候选里 `both` 的比例，即真实的系统性压力，9 个 batch = 1 个 iteration，3 个 seed 平均）：
+
+| lr | entropy_coef | H(batch0) | H(batch8) | 变化 | p(both) |
+|---|---|---|---|---|---|
+| 0.05 | 0 | 1.313 | 1.061 | −0.252 | 0.640 |
+| 0.05 | 0.01 | 1.313 | 1.215 | −0.098 | 0.544 |
+| 0.05 | 0.03 | 1.313 | 1.344 | +0.031 | 0.370 |
+| 0.01 | 0 | 1.313 | 1.321 | +0.008 | 0.283 |
+| 0.01 | 0.01 | 1.313 | 1.347 | +0.033 | 0.278 |
+| 0.01 | 0.1 | 1.313 | 1.362 | +0.049 | 0.241 |
+
+读法：**lr 从 0.05 降到 0.01 已经把坍缩压力基本消掉**（−0.252 → +0.008），熵正则是在这之上再加一层保险。
+选 `entropy_coef=0.01` 而不是更大，是因为 coef=0.1 时 p(both)=0.241 已经贴着均匀分布 0.25——等于把 reward
+信号整个淹掉，router 什么也学不到；coef=0.01 下 p(both)=0.278 仍然高于 0.25，说明信号还在起作用。
+（注意这是无噪声的系统性信号模拟，真实 advantage 有噪声，方差会更大；这张表只用来定**相对量级**。）
+
+**改动**：
+1. `router_policy.py` 新增 `action_distribution()`，`sample_action()` 返回值从 `(route, logprob)` 变成
+   `(route, logprob, dist)`——返回整个 `Categorical` 而不只是熵，因为 `.probs` 还要拿来做逐 route 诊断。
+   两者都挂在计算图上，所以熵项可微。
+2. `router_bank_builder.py` 每条决策额外记 `entropy` / `probs`；greedy 路径也记（`no_grad`），这样
+   validation 也能看到分布，而不是只有 argmax。
+3. `train_router_selfreward.py` loss 变成 `pg_term - entropy_coef * entropy_sum`，两项都在"所有候选 ×
+   所有决策"上求和，量级自然对齐（都随 K × batch_size 增长）。新增 `--entropy-coef`（默认 0.01），
+   `--lr` 默认 0.05 → 0.01。日志新增 `pg_term` / `mean_entropy` / `entropy_coef`。
+4. 产物目录 `cheap_train_v3` → `cheap_train_v4`，record_protocol 和 experiment 名一并改成 v4，
+   避免跟已有 checkpoint / 日志混在一起。
+
+**冒烟测试**（都不占 GPU，跑在真实训练启动之前）：
+- `scripts/smoke/smoke_entropy_regularization.py`：验证 `sample_action` 确实返回完整分布、熵可微、
+  熵等于 −Σp·log p；构造一个已经确定性的分布（bias=6.0，H=0.052），确认熵项的梯度把它推向更分散
+  （50 步后 H=1.148，p(both) 0.993 → 0.576）；以及 entropy_coef 越大分布越散的单调性。
+- `scripts/smoke/smoke_batch_update_e2e.py`：只 stub 掉两个边界（writer LLM 的 `ModelClient`、AppWorld
+  评测子进程），跑**真实的** `run_one_batch_update`，确认参数确实更新、熵项确实进了 loss
+  （`loss != pg_term`，而 `entropy_coef=0` 时两者相等）、同一 seed 下开熵正则比不开熵更高。
+
+**一个校准上的坑，记下来免得下次踩**：从一个**已经完全坍缩**的 router（bias=6.0）出发，lr=0.01 时恢复
+非常慢——Adam 每步最多挪 ~lr，抹平 6 个单位的 bias 需要几百步，不是几步。所以熵正则的作用是**预防**，
+不是**救回**：一旦 checkpoint 已经坍了，正确做法是重新初始化，而不是指望加了熵正则接着训能自己爬回来。
+
+**本次真实训练**：`--rollouts-per-batch 8 --batch-size 10 --lr 0.01 --entropy-coef 0.01`，
+输出 `router_reward_v1/cheap_train_v4/`。两个 TP=2 副本跑在 GPU (4,5) 和 (6,7)，端口 **8010 / 8011**
+——不是 §11 的 8000/8001，因为这台机器（COE-CS-sv002）上 8000-8002 被别的用户占着。
+
+**顺带修正 §11 的一个结论**：§11 说"两个副本之间对同一个 prompt 也逐字节相同"。这次在 COE-CS-sv002 上
+用 5 个 prompt 重测，**4/5 相同、1/5 不同**（差异出现在第 180 个字符之后，是 `` `song_id` `` vs
+`song ID` 这种措辞级差别，典型的 MoE expert GEMM atomics 累加顺序不确定性）。副本**各自内部**仍然是
+确定性的（A 连发 3 次、B 连发 2 次都逐字节相同），所以 §11 "副本内确定"的部分成立，"副本间确定"那半句
+是拿单个短 prompt 抽查得出的，过强了。
+
+对本实验的影响：self-eval 按 k 的奇偶分到两个副本上，所以同一批候选之间的 pass_rate 差异里，混进了一点
+"跑在哪个副本上"的噪声（rollout 有 25-77 步，一个 token 分岔会被放大）。但副本分配（k 的奇偶）与采样出的
+route 是相互独立的——route 由 `torch.manual_seed(...+k)` 决定，跟副本无关——所以这是**方差**，不是
+系统性偏向某个 route 的**偏差**，不会伪造出"`both` 更好"的信号。v2/v3 用的是同一套机制，所以这不是 v4
+引入的新问题。留作已知项：如果以后要压这部分方差，办法是让同一个候选的 self-eval 固定跑在同一个副本上、
+或者干脆同副本串行（代价是墙钟时间翻倍）。
