@@ -34,8 +34,22 @@ from trajectory_memory_lab.model_client import ModelReply  # noqa: E402
 from trajectory_memory_lab.router_policy import (  # noqa: E402
     ROUTES,
     RouterPolicy,
+    TEXT_HASH_DIM,
     action_distribution,
 )
+
+
+def _feats() -> torch.Tensor:
+    """Same rationale as scripts/smoke/smoke_entropy_regularization.py's
+    feats(): shaped like a real feature vector (sparse one-hot hashed blocks),
+    not a dense linspace across all of FEATURE_DIM."""
+    numeric = torch.tensor([1.0, 0.5, 0.3], dtype=torch.float32)
+    recent = torch.zeros(TEXT_HASH_DIM, dtype=torch.float32)
+    recent[3] = 1.0
+    draft = torch.zeros(TEXT_HASH_DIM, dtype=torch.float32)
+    draft[7] = 1.0
+    return torch.cat([numeric, recent, draft])
+
 
 FAILURES: list[str] = []
 
@@ -134,7 +148,7 @@ def run_batch(entropy_coef: float, tmp: Path, seed_model: RouterPolicy, lr: floa
             model, opt, 1, batch_idx, task_ids, trajectories, bank, 0, 90, args,
         )
     moved = max(float((p.detach() - b).abs().max()) for p, b in zip(model.parameters(), before))
-    feats = torch.tensor([1.0, 0.5, 0.3, 0.4, 0.6])
+    feats = _feats()
     dist = action_distribution(model, feats)
     return moved, float(dist.entropy().detach()), dist.probs.detach(), T.TRAIN_LOG
 
@@ -148,7 +162,7 @@ try:
         seed.linear.weight.zero_()
         seed.linear.bias.zero_()
         seed.linear.bias[ROUTES.index("both")] = 6.0
-    H_start = float(action_distribution(seed, torch.tensor([1.0, 0.5, 0.3, 0.4, 0.6])).entropy())
+    H_start = float(action_distribution(seed, _feats()).entropy())
 
     print("\n1. real run_one_batch_update, LLM + AppWorld eval stubbed")
     print(f"  starting router: collapsed on 'both', H={H_start:.4f}")

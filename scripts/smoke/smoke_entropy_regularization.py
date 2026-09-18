@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from trajectory_memory_lab.router_policy import (  # noqa: E402
     ROUTES,
     RouterPolicy,
+    TEXT_HASH_DIM,
     action_distribution,
     sample_action,
 )
@@ -51,7 +52,18 @@ def collapsed_router(dominant: str = "both", margin: float = 6.0) -> RouterPolic
 
 
 def feats() -> torch.Tensor:
-    return torch.tensor([1.0, 0.5, 0.3, 0.4, 0.6], dtype=torch.float32)
+    # Shaped like a REAL feature vector, not just FEATURE_DIM-sized: 3 numeric
+    # features at realistic scale, plus two one-hot hashed-text blocks (real
+    # `_hash_bag_of_words` output always sums to 1 per block, sparse for short
+    # text). A dense linspace(0,1,...) input has a much larger dot-product
+    # magnitude than any real input and changes how fast collapse happens --
+    # not what this test is about.
+    numeric = torch.tensor([1.0, 0.5, 0.3], dtype=torch.float32)
+    recent = torch.zeros(TEXT_HASH_DIM, dtype=torch.float32)
+    recent[3] = 1.0
+    draft = torch.zeros(TEXT_HASH_DIM, dtype=torch.float32)
+    draft[7] = 1.0
+    return torch.cat([numeric, recent, draft])
 
 
 # --- 1. sample_action exposes the full distribution -------------------------

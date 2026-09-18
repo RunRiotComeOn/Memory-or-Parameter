@@ -36,6 +36,7 @@ exec "$project_root/.venv/bin/vllm" serve "$model_path" \
   --host 127.0.0.1 \
   --port "${PORT:-8000}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE:-4}" \
+  --pipeline-parallel-size "${PIPELINE_PARALLEL_SIZE:-1}" \
   --max-model-len "${MAX_MODEL_LEN:-65536}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION:-0.88}" \
   --enforce-eager \

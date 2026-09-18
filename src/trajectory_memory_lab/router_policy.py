@@ -16,6 +16,7 @@ cannot generate free text. Only the discrete route choice is learned.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,32 +27,65 @@ from torch.distributions import Categorical
 
 ROUTES: tuple[str, ...] = ("memory", "sft", "both", "neither")
 
-# Feature order (5 features -> 4 logits, ~24 params total):
+# Text-content visibility (DESIGN.md section 13): the router previously saw
+# only scalar proxies of "how much has already been written" (bank size,
+# fraction through the chain). Position-in-chain features were dropped
+# entirely -- `frac_remaining` is an exact linear complement of `frac_position`
+# given a fixed 90-task domain, so it added zero expressive power to a linear
+# model, and `frac_position` itself never had a demonstrated reason to matter
+# more than the two features below. In its place the router now sees a hashed
+# bag-of-words of two pieces of ACTUAL text: what changed in the bank recently,
+# and what this task's own candidate write would say. Hashing (not an
+# embedding model) keeps the whole policy a linear layer over a fixed-size
+# vector -- no new dependency, still one GRPO-trainable nn.Linear.
+TEXT_HASH_DIM = 16
+
+# Feature order (3 + 2*TEXT_HASH_DIM -> 4 logits):
 #   0: base_agent success (0/1)
 #   1: base_agent reward (float, AppWorld's raw scalar reward)
 #   2: active_memory_count / 20  (bank size so far, soft-normalized)
-#   3: position / task_ids_len   (fraction through the domain chain)
-#   4: trajectories_remaining / task_ids_len
-FEATURE_DIM = 5
+#   3..3+H-1:   hashed bag-of-words of entries added/changed in the last two
+#               batches (router_bank_builder._recent_changes_text)
+#   3+H..3+2H-1: hashed bag-of-words of THIS task's already-drafted candidate
+#               memory + sft content (router_bank_builder._draft_content_text)
+FEATURE_DIM = 3 + 2 * TEXT_HASH_DIM
+
+
+def _hash_bag_of_words(text: str, dim: int) -> torch.Tensor:
+    """Deterministic term-frequency vector over `dim` hashed buckets.
+
+    Not learned, not an embedding model -- md5(token) % dim, counts normalized
+    to sum to 1 so the vector reflects vocabulary *composition* rather than
+    text length. Empty text is the zero vector (a real, distinct state from
+    "wrote something forgettable"), which the linear layer can key off of.
+    """
+    from .memory_writer_harness import _tokens
+
+    vec = torch.zeros(dim, dtype=torch.float32)
+    tokens = _tokens(text) if text else []
+    if not tokens:
+        return vec
+    for token in tokens:
+        bucket = int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16) % dim
+        vec[bucket] += 1.0
+    return vec / vec.sum()
 
 
 def features_of(
     trajectory: dict[str, Any],
     bank: list[dict[str, Any]],
-    position: int,
-    task_ids_len: int,
+    recent_changes_text: str,
+    draft_text: str,
 ) -> torch.Tensor:
     from .alloc_writer_harness import active_entries
 
     success = 1.0 if trajectory.get("success") else 0.0
     reward = float(trajectory.get("reward") or 0.0)
     active_count = len(active_entries(bank)) / 20.0
-    frac_position = position / max(task_ids_len, 1)
-    frac_remaining = (task_ids_len - position) / max(task_ids_len, 1)
-    return torch.tensor(
-        [success, reward, active_count, frac_position, frac_remaining],
-        dtype=torch.float32,
-    )
+    numeric = torch.tensor([success, reward, active_count], dtype=torch.float32)
+    recent_feat = _hash_bag_of_words(recent_changes_text, TEXT_HASH_DIM)
+    draft_feat = _hash_bag_of_words(draft_text, TEXT_HASH_DIM)
+    return torch.cat([numeric, recent_feat, draft_feat])
 
 
 class RouterPolicy(nn.Module):

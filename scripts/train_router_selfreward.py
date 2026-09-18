@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Per-batch GRPO training using SELF-replay reward instead of a fixed probe
-set (DESIGN.md section 14). Sibling of train_router_cheap_reward.py, which
+set (DESIGN.md section 10). Sibling of train_router_cheap_reward.py, which
 uses a fixed 15-task dev subset as reward for every single batch of every
 iteration -- that script's code is left untouched; this is a separate
 experiment, not a replacement.
@@ -61,7 +61,7 @@ GROUP = "appworld"
 TRAIN_ROLLOUT = ROOT / "appworld_experiment/base_train_v2"
 PROBE_BASELINE_ROLLOUT = ROOT / "appworld_experiment/noise_serial_v1/run_a"
 PROBE_SET_SIZE = 15  # only used for the end-of-iteration validation split now, not training
-OUTPUT_ROOT = ROOT / "router_reward_v1/cheap_train_v4"
+OUTPUT_ROOT = ROOT / "router_reward_v1/cheap_train_v5"
 CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
 TRAIN_LOG = OUTPUT_ROOT / "train_log.jsonl"
 
@@ -180,6 +180,7 @@ def sample_k_candidates(
             "k": k, "dir": cand_dir, "bank": result.bank, "decisions": result.decisions,
             "route_counts": Counter(d["route"] for d in result.decisions),
             "active_entries": len([e for e in result.bank if e["status"] == "active"]),
+            "records": result.summary["records"],
         })
     return candidates
 
@@ -266,10 +267,24 @@ def run_one_batch_update(
     candidates = sample_k_candidates(router_model, iteration, batch_idx, batch_task_ids, trajectories, canonical_bank, position, total_task_count, args)
     score_candidates_self_only(candidates, batch_task_ids, iteration, batch_idx, args)
 
+    # DESIGN.md section 14: subtracting self_baseline as a per-candidate
+    # constant and THEN re-centering on the group mean cancels it out exactly
+    # -- advantage_k = (pass_k - baseline) - mean_j(pass_j - baseline) =
+    # pass_k - mean_j(pass_j). The no-memory baseline never reaches the
+    # gradient; the router only ever learns "better than my K-1 siblings",
+    # which is a real answer even when every sibling in the batch is worse
+    # than doing nothing at all. A K+1-way-mean fix was tried and reverted:
+    # folding self_baseline into the group mean as a free extra reference
+    # point only gives it 1/(K+1) weight, diluting fast as K grows (1/9 at
+    # K=8) -- correct direction, likely too weak to matter, and no better
+    # weighting has been worked out yet. Reverted to the plain group-relative
+    # advantage; self_baseline/rewards are still computed and logged purely
+    # as a diagnostic, not used in the actual gradient.
     self_baseline = statistics.mean(1.0 if trajectories[t]["success"] else 0.0 for t in batch_task_ids)
-    rewards = [c["self_pass_rate"] - self_baseline for c in candidates]
-    mean_reward = statistics.mean(rewards)
-    advantages = [r - mean_reward for r in rewards]
+    pass_rates = [c["self_pass_rate"] for c in candidates]
+    rewards = [p - self_baseline for p in pass_rates]  # diagnostic only, see above
+    mean_pass = statistics.mean(pass_rates)
+    advantages = [p - mean_pass for p in pass_rates]
 
     optimizer.zero_grad()
     # Policy-gradient term summed over every decision in every candidate, plus an
@@ -297,7 +312,8 @@ def run_one_batch_update(
     chosen = random.choice(candidates)
     print(
         f"[iter{iteration} b{batch_idx}] self_pass_rates={[round(c['self_pass_rate'],3) for c in candidates]} "
-        f"self_baseline={self_baseline:.3f} rewards={[round(r,3) for r in rewards]} advantages={[round(a,3) for a in advantages]} "
+        f"self_baseline={self_baseline:.3f} mean_pass={mean_pass:.3f} rewards={[round(r,3) for r in rewards]} "
+        f"advantages={[round(a,3) for a in advantages]} "
         f"loss={loss.item():.4f} pg_term={pg_term.item():.4f} mean_entropy={mean_entropy:.4f} "
         f"chosen_k={chosen['k']} chosen_self_pass_rate={chosen['self_pass_rate']:.4f}",
         flush=True,
@@ -309,6 +325,7 @@ def run_one_batch_update(
         "active_entries": [c["active_entries"] for c in candidates],
         "self_pass_rates": [c["self_pass_rate"] for c in candidates],
         "self_baseline": self_baseline,
+        "mean_pass": mean_pass,
         "rewards": rewards,
         "advantages": advantages,
         "loss": loss.item(),
@@ -317,6 +334,33 @@ def run_one_batch_update(
         "entropy_coef": args.entropy_coef,
         "chosen_k": chosen["k"],
     }
+    # DESIGN.md section 15: actually train the sft route in, instead of just
+    # recording repair plans that nothing downstream ever consumed. Only the
+    # CHOSEN candidate's sft/both picks are replayed -- replaying all K would
+    # multiply AppWorld-eval cost by K for no reward benefit, since only the
+    # chosen candidate's bank continues into the next batch anyway.
+    from trajectory_memory_lab.router_sft_pipeline import (
+        append_to_pool, collect_batch_sft_examples, maybe_trigger_training,
+        sft_candidates_from_records,
+    )
+    pool_path = OUTPUT_ROOT / "sft_pool.jsonl"
+    pool_size_before = sum(1 for _ in pool_path.open()) if pool_path.exists() else 0
+    replay_dir = OUTPUT_ROOT / f"iter{iteration}" / f"b{batch_idx}" / "sft_replays"
+    sft_examples = collect_batch_sft_examples(
+        chosen["records"], replay_dir, args.model, args.base_url, seed=20260822 + batch_idx,
+    )
+    pool_size_after = append_to_pool(pool_path, sft_examples)
+    log_record["sft_candidates_replayed"] = len(sft_candidates_from_records(chosen["records"]))
+    log_record["sft_examples_verified"] = len(sft_examples)
+    log_record["sft_pool_size"] = pool_size_after
+    print(
+        f"[iter{iteration} b{batch_idx}] sft: {log_record['sft_candidates_replayed']} replayed, "
+        f"{len(sft_examples)} verified (reward=1), pool now {pool_size_after}",
+        flush=True,
+    )
+    if maybe_trigger_training(pool_path, OUTPUT_ROOT / "lora_work", pool_size_before, pool_size_after):
+        log_record["sft_lora_retrained_at_pool_size"] = pool_size_after
+
     TRAIN_LOG.parent.mkdir(parents=True, exist_ok=True)
     with TRAIN_LOG.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(log_record, ensure_ascii=False) + "\n")
@@ -348,11 +392,27 @@ def main() -> None:
     num_batches = len(split_batches(task_ids, args.batch_size))
     est_minutes_per_eval = 70  # observed single-eval pace, DESIGN.md section 12/14
     rounds_per_batch = -(-args.rollouts_per_batch // 2)  # ceil(K/2), 2-way concurrency
-    est_hours = rounds_per_batch * num_batches * est_minutes_per_eval / 60 + 3.5
+    self_eval_hours = rounds_per_batch * num_batches * est_minutes_per_eval / 60
+    # DESIGN.md section 14/15 additions, all rough and unverified until observed
+    # once: a guided replay is a single-task rollout (~1/10th of a 10-task
+    # self-eval); assume ~2 committed sft/both decisions per batch since the
+    # actual rate is unknown before this router has ever run. A LoRA-retrain
+    # trigger (train + CPU merge + both replicas cold-starting) has never been
+    # timed end-to-end -- 60 min is a placeholder, not a measurement.
+    est_replays_per_batch = 2
+    replay_hours = num_batches * est_replays_per_batch * (est_minutes_per_eval / 10) / 60
+    est_examples_total = num_batches * est_replays_per_batch  # optimistic: assumes every replay verifies
+    est_lora_triggers = est_examples_total // 8
+    est_lora_hours_per_trigger = 1.0
+    lora_hours = est_lora_triggers * est_lora_hours_per_trigger
+    est_hours = self_eval_hours + replay_hours + lora_hours + 3.5
     print(
         f"plan: {num_batches} batches/iteration x {args.rollouts_per_batch} rollouts/batch "
-        f"({rounds_per_batch} rounds/batch of 2-way concurrent self-evals) ~{est_hours:.1f}h/iteration "
-        f"(at observed ~{est_minutes_per_eval}min/eval) x {args.iterations} iteration(s)",
+        f"({rounds_per_batch} rounds/batch of 2-way concurrent self-evals) "
+        f"~{self_eval_hours:.1f}h self-eval + ~{replay_hours:.1f}h sft guided-replay "
+        f"(assumed {est_replays_per_batch}/batch, UNVERIFIED) + ~{lora_hours:.1f}h LoRA retrain/reload "
+        f"(assumed ~{est_lora_triggers} trigger(s) at {est_lora_hours_per_trigger}h each, UNVERIFIED, "
+        f"never timed end-to-end) = ~{est_hours:.1f}h/iteration x {args.iterations} iteration(s)",
         flush=True,
     )
     if not args.yes:

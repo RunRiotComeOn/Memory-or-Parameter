@@ -31,3 +31,4 @@ tau_experiment/
 timewarp_*/
 router_reward_v1/*
 !router_reward_v1/DESIGN.md
+!router_reward_v1/PIPELINE.md

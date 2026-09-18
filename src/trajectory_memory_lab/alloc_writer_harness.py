@@ -211,8 +211,15 @@ def apply_memory_operation(
     entry_id: str,
     source_task_id: str,
     rubric_id: str,
+    created_position: int | None = None,
 ) -> dict[str, Any]:
-    """Commit one validated memory operation to the running bank."""
+    """Commit one validated memory operation to the running bank.
+
+    `created_position` (router_reward_v1/DESIGN.md section 13) is the task-loop
+    position at which this entry was written -- optional and unused by callers
+    that don't need it, but it's what lets a later task's "recent bank changes"
+    window be computed without re-deriving it from record files on disk.
+    """
     memory = decision["memory"]
     operation = decision["memory_operation"]
     target_id = decision.get("target_memory_id")
@@ -227,6 +234,7 @@ def apply_memory_operation(
         "supersedes": target_id if operation in {"refine", "replace"} else None,
         "source_task_id": source_task_id,
         "rubric_id": rubric_id,
+        "created_position": created_position,
     }
     if operation in {"refine", "replace"}:
         for existing in bank:

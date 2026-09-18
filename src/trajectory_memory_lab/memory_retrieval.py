@@ -10,10 +10,20 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+# Where the mem0 sidecar listens. mem0 cannot be imported in `appworld_venv`
+# (pydantic 1 vs 2), so a mem0-backed bank is reached over localhost instead --
+# see scripts/serve_mem0_retrieval.py.
+MEM0_SIDECAR_URL = os.environ.get("MEM0_SIDECAR_URL", "http://127.0.0.1:8020")
+# Optional similarity floor for mem0 retrieval; unset means mem0's default of
+# filling every top-k slot no matter how weak the match.
+MEM0_SCORE_THRESHOLD = os.environ.get("MEM0_SCORE_THRESHOLD")
 
 
 MEMORY_TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
@@ -107,12 +117,45 @@ def render_memory_block(entries: list[dict[str, str]]) -> str:
     )
 
 
+def is_mem0_bank(bank_path: str | Path) -> bool:
+    """A mem0 bank is a directory (holding qdrant/ + history.db); the legacy
+    bank is a single .json file. Dispatching on that keeps every pre-mem0 run
+    reproducible byte-for-byte through the BM25 path below."""
+    return Path(bank_path).is_dir()
+
+
+def retrieve_mem0(
+    store_path: str | Path, query: str, top_k: int
+) -> list[tuple[dict[str, str], float]]:
+    """Ask the sidecar. Errors are raised, never swallowed into an empty result:
+    a silently empty memory bank looks exactly like a working one that found
+    nothing, and that is how a whole eval can be spent measuring nothing."""
+    body_dict: dict[str, Any] = {"store": str(store_path), "query": query, "top_k": top_k}
+    if MEM0_SCORE_THRESHOLD:
+        body_dict["threshold"] = float(MEM0_SCORE_THRESHOLD)
+    payload = json.dumps(body_dict).encode()
+    request = urllib.request.Request(
+        f"{MEM0_SIDECAR_URL}/search", data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        body = json.loads(response.read())
+    if "error" in body:
+        raise RuntimeError(f"mem0 sidecar error: {body['error']}")
+    return [(item["entry"], float(item["score"])) for item in body.get("results", [])]
+
+
 def retrieved_block(
     bank_path: str | Path | None, query: str, top_k: int
 ) -> tuple[str, list[dict[str, Any]]]:
     """Convenience: load, retrieve, render. Returns (block, selection log)."""
     if not bank_path:
         return "", []
+    if is_mem0_bank(bank_path):
+        ranked = retrieve_mem0(bank_path, query, top_k)
+        selected = [entry for entry, _ in ranked]
+        log = [{"id": e.get("id"), "score": round(s, 3)} for e, s in ranked]
+        return render_memory_block(selected), log
     entries = load_bank(bank_path)
     ranked = retrieve(entries, query, top_k)
     selected = [entry for entry, _ in ranked]

@@ -416,3 +416,165 @@ route 是相互独立的——route 由 `torch.manual_seed(...+k)` 决定，跟�
 系统性偏向某个 route 的**偏差**，不会伪造出"`both` 更好"的信号。v2/v3 用的是同一套机制，所以这不是 v4
 引入的新问题。留作已知项：如果以后要压这部分方差，办法是让同一个候选的 self-eval 固定跑在同一个副本上、
 或者干脆同副本串行（代价是墙钟时间翻倍）。
+
+## 14. Reward 组内比较丢掉了无记忆基线；router 特征改造；SFT 真正训练进去（2026-09-18）
+
+三件相关但独立的改动，都是同一天做的，写在一起：
+
+### 14.1 GRPO advantage 把无记忆基线抵消掉了
+
+`train_router_selfreward.py` 一直是这样算的：
+```python
+rewards = [c.self_pass_rate - self_baseline for c in candidates]     # 跟基线比
+advantages = [r - mean(rewards) for r in rewards]                     # 再减组内均值
+```
+代入化简：`advantage_k = (pass_k - baseline) - mean_j(pass_j - baseline) = pass_k - mean_j(pass_j)`——`self_baseline` 精确抵消，从未真正进入梯度。router 只学到"比同批候选好/差"，即使这一整批候选全都不如什么都不写，也学不到"不写"更好。这与本项目至今每一次 validation（v2=0.3684、v3_g4=0.4035）都低于基线（重新核对前的 0.4386）这个现象一致。
+
+**改法**：把 `self_baseline` 当成组里免费的第 K+1 个参照点一起取均值（它是已知量，不需要额外评测）：
+```python
+group_mean = mean(pass_rates + [self_baseline])
+advantages = [p - group_mean for p in pass_rates]
+```
+这样如果一批候选普遍不如基线，advantage 会整体转负。
+
+### 14.2 副本不可比：0.4386 这个基线本身需要重新验证
+
+另一台机器同一天在 §13 里证明了跨副本/跨运行的绝对分数不可比（差距可达 10-20pp）。核查发现 0.4386 来自 `noise_serial_v1/run_a`，生成于 2026-08-29——比两副本确定性 serving 搭建（09-12）还早，几乎肯定是不同服务端配置。G=8 那次"超过基线"的结论（0.5789 vs 0.4386）因此不成立，已经在 G=8 用的同一个副本（127.0.0.1:8000）上补跑一次匹配的无记忆基线（`router_reward_v1/baseline_recheck/`）。
+
+### 14.3 Router 特征：去掉两个线性冗余特征，换成真实内容的哈希词袋
+
+`frac_remaining = 1 - frac_position`，给定 `total_task_count` 恒为 90，对线性模型是精确的线性冗余，零边际信息量；`frac_position` 本身也一直没有证据表明有用。两个都删。换成两块哈希词袋特征（`router_policy.TEXT_HASH_DIM=16`，md5(token)%16 计数后归一化，不训练、不是 embedding 模型）：
+- 最近两个 batch 里 bank 新增/变动条目的实际文本（`router_bank_builder._recent_changes_text`，靠 `alloc_writer_harness.apply_memory_operation` 新增的 `created_position` 字段回溯）；
+- 这道题已经起草好的候选内容的实际文本（`_draft_content_text`）。
+
+配合的架构改动（"content-before-route"）：`router_bank_builder.run_router_chain` 现在**先起草内容再决定路由**，而不是先路由再让 LLM 照着写——router 看到的是真实草稿文本的哈希特征，不是数字代理。代价：每道题都要起草一次内容，即使最后路由是 `neither`（以前 `neither` 完全不调 LLM）。`FEATURE_DIM` 从 5 变成 `3 + 2*16 = 35`。
+
+### 14.4 SFT 真正训练进去，写手换成专门的 SFT writer
+
+此前 `sft_plan` 只是记录一条 `repair_target` 一句话描述，从未被消费——route=`sft` 和 route=`neither` 因此在 reward 上完全等价（都不改变任何评测结果），router 根本没有机会学会二者的取舍。
+
+**内容生成换人**：memory 和 sft 不再共用一次"both"起草调用。memory 仍走 `routed_writer_system("memory")`；sft 换成新写的专用 writer（`appworld_sft_writer.APPWORLD_SFT_WRITER_SYSTEM`），只在 `base_agent_success=False` 时调用（成功的题没有"错误"可修）。这个 writer **不是另外训练的教师模型**，是同一个基座模型换一个 system prompt——参考 tau2-bench 那条已经跑通的"SFT-data writer"经验（`tau_sft_data_writer.py`），但产出形式不同：tau2-bench 那边产出一段可以逐字节脚本回放的 `assistant_turns`（因为要喂给一个模拟用户参与的对话回放框架）；AppWorld 没有模拟用户轮次、是纯代码执行循环，逐字节脚本回放一碰到任何一个没预测到的真实 API 返回值就会脱轨，所以这里让 writer 只产出一段**自然语言修复计划**（具体该调哪些 API、顺序、原来错在哪），像 `memory_block` 一样注入到一次全新尝试的初始 user message 里（`appworld_agent.build_initial_user_message` 本来就是纯文本拼接，零改动可以直接复用），交给一个真实的 agent 在真实环境里重新执行、自己应对真实返回值。
+
+**只有真正 replay 成功的才算数**：`scripts/run_appworld_guided_replay.py` 对 committed 的 sft/both 决策，用这段计划文本重新跑一次全新的这道题；`trajectory_memory_lab.router_sft_pipeline.replay_and_verify` 只在 AppWorld 自己判定 `success=True` 时才把这次 replay 的**真实对话记录**（不是 writer 的计划文本本身）转成一条训练样本——计划只是提示，标签永远来自真实环境的真实反馈。
+
+**只 replay 被选中候选的 sft 决策**：一个 batch 有 K 个候选，只对 `random.choice` 选中、真正延续到下一 batch 的那个候选做 replay，不是全部 K 个——否则 AppWorld 评测成本乘以 K，而其余 K-1 个候选的 bank 反正不会被继续使用。
+
+**训练触发**：验证样本积累到 `TRAIN_TRIGGER_SIZE=8`（跨过一个 8 的倍数即触发一次，不是每条都触发）就跑一次 `scripts/router_sft_lora_update.sh`：
+1. 暂停 `det_server_b`，空出 GPU 2、3，用 `.train-venv/bin/swift sft`（ms-swift，LoRA rank 8，复用仓库里 `train_qwen_lora.sh` 已验证过的超参）在整个累积池（不是增量续训，每次都从 base model 全量重训，避免多次小步 LoRA 叠加的漂移风险）上训一次；
+2. 暂停 `det_server_a`，用 `scripts/merge_qwen_lora.py`（CPU-only，不占 GPU）把 LoRA 合并进 base weights，产出一份独立的合并 checkpoint；
+3. **两个副本都**指向这份合并后的 checkpoint重新拉起，`served-model-name` 仍是 `qwen35-tau`，端口/TP/GPU 配置和原来完全一致。
+
+**为什么两个副本都要重载，而不是像 `serve_tau_agent_sft_lora.sh` 那样只给一个副本挂 `--lora-modules`**：det_server_a/b 至今被当成完全等价的两个副本，候选按 k 奇偶分派纯粹是为了并行、和路由采样无关（§11/§13 的论证基础）。如果只有一个副本换成微调后的模型，"candidate 落在哪个副本上"会突然变成一个决定它能不能看到微调效果的、系统性的因素——这正是 §13 花一整节讲清楚的"副本不等价"陷阱，会直接在 reward 里种下一个混淆变量。合并权重、两边都重载，是唯一能保住"副本可互换"这个前提的做法。代价是每次触发要多一步 CPU 合并（本机 503GB 内存、4.8TB 硬盘余量，够用）和两个副本的重启时间。
+
+**尚未验证**：这一整条链路（SFT writer → guided replay → 训练触发 → 双副本重载）还没有跑过一次真实端到端；下一次正式训练如果触发了 SFT 训练，第一次触发时需要盯着看 `router_sft_lora_update.sh` 的输出确认两个副本都正常起来了。
+
+## 13. 记忆后端三方对比与检索量实验（2026-09-17，v5/v6）
+
+起因：v4 训练跑到 batch 2 时发现记忆相对无记忆基线大幅掉分，逐条追查后做了一整轮受控对比。
+结论先写在前面：**三个后端之间的差别，远小于「用不用记忆」本身的效应；而记忆整体在这个
+setup 下平均为负。**
+
+### 13.1 方法学：三个必须先修的对照问题
+
+这轮最大的收获不是某个数字，而是三个对照缺失，每一个都曾让我得出错误结论：
+
+1. **副本之间不等价。** 同一个 bank、同一 seed、同一批任务，TP=2 副本给 0.70、PP=3 副本给
+   0.60；两个同为 TP=2 但 GPU 不同的副本也能差 10pp。**跨副本的绝对分数不可比。**
+   修法：每个候选的所有实验臂绑定到同一个副本，只比较候选内部的差值。
+   代价是必须为每个副本单独跑无记忆锚点。
+   三个副本各自的确定性对照（同 bank 同副本重跑）全部通过：k1/k4/k6 逐题一致。
+
+2. **基线用错。** 此前所有「比基线差 X pp」都以 `base_train_v2` 的 0.80 为准，但那是另一次运行、
+   另一套服务端记录的。实测三个副本的真实无记忆分数是 **A=0.70、B=0.70、C=0.60**。
+   这一项单独就让此前所有损害估计高估了 10–20pp。
+
+3. **mem0 的 `threshold=` 参数不按它返回的 score 过滤。** 实测 `threshold=0.30` 仍返回 0.287 和
+   0.231，`threshold=0.50` 保留 0.287 却丢掉 0.231。直接用它会得到「阈值无效」的错误结论。
+   改为在 `mem0_store.search_entries` 里按返回分数自己过滤。
+
+同一个教训重复了五次：**任何跨运行、跨服务端、跨配置的比较，都必须先有同条件对照。**
+
+### 13.2 三方对比结果（8 候选 × 3 后端 = 24 次评测，全部同副本）
+
+| 候选 | 副本 | 无记忆 | v4(破坏性dedup) | v5(非破坏性合并) | mem0 | mem0+阈值0.30 |
+|---|---|---|---|---|---|---|
+| k0 | C | 0.60 | 0.50 | 0.60 | 0.60 | 0.60 |
+| k2 | C | 0.60 | 0.50 | 0.50 | 0.50 | 0.60 |
+| k3 | A | 0.70 | 0.70 | 0.70 | 0.70 | 0.80 |
+| k4 | C | 0.60 | 0.60 | 0.60 | 0.60 | 0.50 |
+| k5 | A | 0.70 | 0.70 | 0.70 | 0.30 | 0.60 |
+| k6 | B | 0.70 | 0.50 | 0.50 | 0.50 | 0.50 |
+| k7 | B | 0.70 | 0.60 | 0.60 | 0.50 | 0.40 |
+
+平均 Δ vs 无记忆（n=7）：**v4 −7.1pp、v5 −5.7pp、mem0 −12.9pp、mem0+阈值 −8.6pp**。
+**没有任何一个后端在平均意义上超过「不用记忆」。**
+
+### 13.3 §12 那个 dedup bug 的真实影响：+1.4pp
+
+v4 → v5 平均只有 +1.4pp（−7.1 → −5.7）。bug 是真的、机制也查清了（Jaccard 0.25 阈值把互补
+记忆当重复合并，平均只保留旧条目 72% 的内容），但**对最终性能几乎无关紧要**。
+修复只改到 8 个候选中的 2 个（k0、k2），其中只有 k0 有 +10pp。
+
+过程中我连续四次高估这个修复（+20pp → +10pp → +5pp → +1.4pp），每次都是因为拿跨副本数字比较。
+
+### 13.4 检索量是比后端更强的变量
+
+在 k1 的库上做的剂量-反应扫描（同副本 C、同 10 题）：
+
+| 实际注入/题 | 配置 | 分数 |
+|---|---|---|
+| 0.0 | 无记忆 | 6/10 |
+| 0.6 | mem0 阈值0.50 | 7/10 |
+| 1.1 | mem0 阈值0.30 | **9/10** |
+| 1.7 | BM25 top3 | 7/10 |
+| 3.0 | mem0 无阈值 | **3/10** |
+
+倒 U 形，峰值在约 1 条/题。无阈值 mem0 的 3 条/题比完全不给记忆还差一半，且终止状态佐证
+（4 次耗尽步数 vs 阈值版 10/10 正常完成），说明 agent 确实被低相关度记忆带偏。
+
+关键细节：**`--memory-top-k` 这个参数本身不是变量，实际注入条数才是。** BM25 在 top_k=3/5/10
+下实际注入恒为 1.7 条（分数为 0 的不返回），所以扫 top_k 对 BM25 毫无作用；mem0 无过滤、
+硬填满 k 条，才真正改变了注入量。`top_k=3` 这个从 tau2-bench 继承的默认值，此前从未被扫过。
+
+### 13.5 阈值复现失败：k1 是离群值
+
+k1 那个 0.90（+30pp）没有推广。7 个候选加阈值后：**平均 −8.6pp，1 好 2 平 4 差**。
+
+分成两个独立结论：
+- **阈值确实改善 mem0 自身**：平均 +11pp（k5 从 0.30 救回 0.60，k1 从 0.30 到 0.90）——
+  「无过滤硬填满 top-k 有害」这个机制成立。
+- **但改善后仍普遍打不过不用记忆**：说明对多数库而言，问题不只在注入量，**内容本身就没有
+  正价值**。k6 是最干净的反例：过滤掉噪声后分数纹丝不动（0.50），仍比无记忆低 20pp。
+
+### 13.6 对 router 训练的影响
+
+记忆效应在候选之间的摆动幅度是 **+30pp 到 −40pp**，远大于 router 路由决策所能产生的差异。
+这解释了 §12 里那个一直测不出信号的 reward：**被 router 控制不了的变量（记忆内容质量、
+检索注入量）主导了 reward 的方差。** 在记忆本身能稳定产生正收益之前，训练 router 去分配
+记忆是在优化一个信噪比过低的目标。
+
+### 13.7 代码改动
+
+- `router_bank_builder._dedup_against_active_bank`：强制 refine 改为非破坏性合并
+  （保留率 <0.9 时把旧文本并入新条目），§10 的真重复合并行为由冒烟测试守住
+- `src/trajectory_memory_lab/mem0_store.py`：mem0 后端，LLM 指向本地确定性 vLLM，
+  embedder 用 fastembed（**刻意避开 sentence-transformers**，它会把 transformers 从 4.57.3
+  升到 5.17.0 而 vLLM 0.17.1 依赖前者），向量库为每候选独立的本地 qdrant，
+  posthog 遥测在 import 前关闭
+- `scripts/serve_mem0_retrieval.py`：sidecar。`appworld_venv` 是 pydantic 1.10/SQLAlchemy 1.4，
+  mem0 要 pydantic 2/SQLAlchemy 2，直接装会搞坏 AppWorld 评测环境，故走 localhost HTTP
+- `memory_retrieval`：bank 路径是目录则走 mem0，是 .json 则走原 BM25，旧结果仍可复现；
+  新增 `MEM0_SCORE_THRESHOLD` 环境变量
+- `serve_appworld_deterministic.sh`：PORT/TP/PP/显存比例改为环境变量，默认值不变
+
+接 mem0 时踩的四个坑都是**静默失败**（`add` 返回 `{"results": []}` 不报错）：
+reasoning parser 吞掉 content、`custom_fact_extraction_prompt` 在 2.0.20 是死配置、
+默认抽取 prompt 面向个人助理会丢弃 API 知识、`response_format={"type":"json_object"}`
+在本地 vLLM 上产出非法 JSON。sidecar 的检索路径因此特意让错误抛出而非吞成空结果。
+
+### 13.8 下一步的判断
+
+不建议继续在后端/检索层调优——三个后端在 7 个候选里有 4 个给出完全相同的分数，这一层
+已经不是瓶颈。真正未解的是 **13.5 的后半句：记忆内容本身没有正价值**。
+该做的是检查写手产出的记忆是什么、为什么对解题没用（例如是否只是重复 API 文档里已有的信息），
+而不是换第四种存储方案。
