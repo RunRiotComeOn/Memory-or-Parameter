@@ -11,20 +11,28 @@ Every routed decision's live logprob tensor (with grad) is returned alongside
 the JSON-serializable record, so the caller can run a GRPO backward pass
 after collecting a full group of rollouts. Tensors are never written to disk.
 
-Dedup (DESIGN.md section 10): the router only learns `route`, never which
-existing bank entry to touch -- choosing among however many entries are
-currently active is a variable-size action, and RL over that was exactly
-what v1 punted on. But deciding "is this new content basically the same
-claim as something already active" needs no learning at all: it is settled
-by `alloc_writer_harness.topic_overlap`, the same vocabulary-overlap check
-the old LLM-rubric system already used to validate a *chosen* refine. Here
-it runs the other way -- after content is generated, any candidate whose
-best match against the active bank clears `REFINE_TOPIC_OVERLAP_MIN` is
-force-converted from `add` to `refine` against that entry, regardless of
-what the router or the writer LLM said. This is what stops same-template
-task variants (e.g. `07b42fd_1/_2/_3`) from each independently ADDing a
-near-duplicate memory and crowding out other topics' BM25 top-k slots --
-the concrete failure mode found in router_reward_v1/pilot_inbatch_v1.
+Dedup (v6): the forced add->refine rule is GONE. Through v5 it ran after
+content generation and rewrote the decision -- any draft whose best match
+against the active bank cleared `REFINE_TOPIC_OVERLAP_MIN` had its operation
+overwritten to `refine`, its target picked by the rule, and its content
+rewritten -- "regardless of what the router or the writer LLM said". On v5
+batch 0 that fired on 18 of 42 memory writes and rewrote content in 13, so
+nearly half of all committed memories were neither what the writer wrote nor
+what the router chose, while the reward could only attribute the outcome to
+the route. Choosing between add and refine is a judgment about what the bank
+already says, so it now belongs to the writer, which has had `render_bank`
+in its payload all along and was merely forbidden from acting on it (see
+`writer_rubrics.routed_writer_system`); `validate_alloc_decision` still
+enforces that a chosen target is a real active entry.
+
+What the rule was defending against is real and does not go away: the
+near-duplicate crowding found in router_reward_v1/pilot_inbatch_v1 (same
+-template variants like `07b42fd_1/_2/_3` each ADDing near-identical
+memories and monopolizing BM25 top-k), and the v4 failure where a careless
+refine destroyed whatever the superseded entry said and the new text did
+not. Both are now the writer's responsibility to avoid and ours to MEASURE:
+`_duplicate_diagnostics` records the overlap the old rule would have fired
+on and the retention of every writer-chosen refine, without gating either.
 
 Content-before-route (DESIGN.md section 13): earlier versions decided the
 route first and only then asked the writer LLM for content matching that
@@ -76,13 +84,6 @@ from .router_policy import (
 from .writer_rubrics import routed_writer_system
 
 
-# A forced refine whose new text already carries this much of the superseded
-# entry's distinctive vocabulary is a genuine refinement -- the old wording adds
-# nothing and is dropped. Below it, the two entries carry different information
-# and the old text is kept (see the v5 note in DESIGN.md section 13).
-CONTENT_SUBSUMED_MIN = 0.9
-
-
 def _retention(old_text: str, new_text: str) -> float:
     """Fraction of the old text's distinctive tokens that survive in the new one."""
     old = set(_tokens(old_text))
@@ -91,31 +92,26 @@ def _retention(old_text: str, new_text: str) -> float:
     return len(old & set(_tokens(new_text))) / len(old)
 
 
-def _union(first: list[Any], second: list[Any]) -> list[Any]:
-    """Order-preserving union, so merged conditions/exceptions keep both sides."""
-    merged = list(first)
-    seen = {str(item) for item in first}
-    for item in second:
-        if str(item) not in seen:
-            merged.append(item)
-            seen.add(str(item))
-    return merged
+def _duplicate_diagnostics(decision: dict[str, Any], bank: list[dict[str, Any]]) -> None:
+    """Measure only -- never mutates the decision. See the module docstring.
 
+    Two numbers, both recorded on every memory-writing decision and both
+    gating nothing:
 
-def _dedup_against_active_bank(decision: dict[str, Any], bank: list[dict[str, Any]]) -> None:
-    """Mutates `decision` in place: add -> refine when content nearly duplicates
-    an already-active entry, regardless of what route/operation was chosen.
+    `dup_best_overlap` / `dup_would_have_forced_refine` say what the deleted
+    v5 rule would have done, so "did removing it bring the near-duplicate
+    crowding back" is answerable from the records rather than from a pass-rate
+    drop 40 hours later.
 
-    The refine is NON-DESTRUCTIVE. `apply_memory_operation` marks the target
-    superseded and drops it from retrieval, so whatever the target said and the
-    new text does not is lost forever. That is what made v4 so much worse than
-    no memory at all: `REFINE_TOPIC_OVERLAP_MIN` is a Jaccard of 0.25, which two
-    entries share merely by being about the same app, so genuinely complementary
-    memories were being collapsed into whichever was written last. Measured over
-    v4 batches 0-1, forced refines kept only 72% of the superseded entry on
-    average and as little as 17%; retention correlated +0.69 with the candidate's
-    own pass rate. So the old text is carried into the merged entry unless the
-    new text already subsumes it.
+    `refine_retention` is the early warning for the OTHER failure mode. When
+    the writer chooses `refine`/`replace`, `apply_memory_operation` marks the
+    target superseded and drops it from retrieval, so anything the target said
+    and the new content does not is lost for good. That is exactly what made
+    v4 worse than writing no memory at all: forced refines kept only 72% of
+    the superseded entry on average and as little as 17%, and retention
+    correlated +0.69 with the candidate's own pass rate. v5 defended against
+    that by splicing the old text in mechanically; v6 asks the writer to carry
+    it over (`routed_writer_system`) and measures whether it actually did.
     """
     memory = decision.get("memory")
     if not memory:
@@ -123,23 +119,21 @@ def _dedup_against_active_bank(decision: dict[str, Any], bank: list[dict[str, An
     candidates = active_entries(bank)
     if not candidates:
         return
-    best = max(candidates, key=lambda entry: topic_overlap(memory, entry))
-    if topic_overlap(memory, best) < REFINE_TOPIC_OVERLAP_MIN:
-        return
-    decision["memory_operation"] = "refine"
-    decision["target_memory_id"] = best["id"]
 
-    old_text = (best.get("content") or "").strip()
-    new_text = (memory.get("content") or "").strip()
-    retention = _retention(old_text, new_text)
-    decision["dedup_retention"] = retention
-    if not old_text or old_text in new_text or retention >= CONTENT_SUBSUMED_MIN:
-        decision["dedup_merged"] = False
-        return
-    memory["content"] = f"{old_text}\n{new_text}"
-    memory["conditions"] = _union(best.get("conditions") or [], memory.get("conditions") or [])
-    memory["exceptions"] = _union(best.get("exceptions") or [], memory.get("exceptions") or [])
-    decision["dedup_merged"] = True
+    best = max(candidates, key=lambda entry: topic_overlap(memory, entry))
+    overlap = topic_overlap(memory, best)
+    decision["dup_best_id"] = best["id"]
+    decision["dup_best_overlap"] = overlap
+    decision["dup_would_have_forced_refine"] = overlap >= REFINE_TOPIC_OVERLAP_MIN
+
+    target_id = decision.get("target_memory_id")
+    if decision.get("memory_operation") in {"refine", "replace"} and target_id:
+        target = next((entry for entry in candidates if entry["id"] == target_id), None)
+        if target is not None:
+            decision["refine_retention"] = _retention(
+                (target.get("content") or "").strip(),
+                (memory.get("content") or "").strip(),
+            )
 
 def _draft_content_text(memory: dict[str, Any] | None, sft_plan: dict[str, Any] | None) -> str:
     """The text a router feature is hashed from -- see DESIGN.md section 13.
@@ -178,9 +172,16 @@ class RouterBuilderConfig:
     record_protocol: str
     model: str = "qwen35-tau"
     base_url: str = "http://127.0.0.1:8000/v1"
-    max_tokens: int = 3072
+    max_tokens: int = 4096
     timeout: float = 1200
     seed: int = 20260822
+    # Who writes the sft repair/consolidation plan -- "teacher" (default, an
+    # external Gemini model) or "self" (the same base model that plays the
+    # task agent). See appworld_sft_writer.py's module docstring for the
+    # probe results behind defaulting to teacher.
+    sft_writer: str = "teacher"
+    teacher_model: str = "gemini-3.1-pro-preview"
+    teacher_api_key_file: Path = Path("/nas04/yixuh/.config/continual-memory/gemini_api_key")
 
 
 @dataclass
@@ -296,11 +297,35 @@ def run_router_chain(
 
         draft_memory = draft_decision.get("memory")
 
-        # Only worth drafting a repair plan for a task that actually failed --
-        # a clean success has no mistake to plan around, and calling the sft
-        # writer on it would just invent one.
+        # v6: drafted for EVERY task, not just failed ones. Through v5 this was
+        # guarded by `if not trajectory.get("success")`, which meant a route of
+        # `sft` landing on an already-successful task could never produce a
+        # plan, was rejected as `missing_plan`, and committed nothing -- making
+        # `sft` bit-for-bit equivalent to `neither`, and `both` to `memory`, on
+        # every successful task. With a base success rate of 0.8 that silently
+        # collapsed a 4-way action space to 2-way on 80% of decisions, and the
+        # reward could never separate the collapsed pairs, so the router had no
+        # gradient by which to learn the difference. Whether a task is worth
+        # training on is a judgment the router should make and be scored on,
+        # not one a caller-side guard should make for it; the writer is handed
+        # `success` and the evaluator verdict (`build_writer_payload`) and
+        # writes the appropriate kind of plan.
         draft_sft_plan: dict[str, Any] | None = None
-        if not trajectory.get("success"):
+        if config.sft_writer == "teacher":
+            # External model (default: Gemini) writes the plan; the base
+            # model still executes it later via guided replay. See
+            # appworld_sft_writer.py's module docstring for why this is the
+            # default (probe_sft_repair_yield_gemini_teacher.py: 62.5% rescue
+            # yield on genuinely-still-failing tasks, running_log.md section
+            # 11). Any failure here (network, bad key, retries exhausted)
+            # returns None exactly like the self-writer's except-clause below
+            # -- not fatal to this task's decision, just no sft plan for it.
+            from .appworld_sft_writer import generate_plan_with_teacher
+
+            writer_output = generate_plan_with_teacher(
+                trajectory, model=config.teacher_model, api_key_file=config.teacher_api_key_file,
+            )
+        else:
             try:
                 from .appworld_sft_writer import (
                     APPWORLD_SFT_WRITER_SYSTEM,
@@ -317,16 +342,16 @@ def run_router_chain(
                 writer_output = validate_writer_output(sft_reply.parsed)
             except Exception:
                 writer_output = None
-            if writer_output is not None:
-                draft_sft_plan = {
-                    "repair_target": (
-                        f"{writer_output['plan']}\n(mistake: {writer_output['mistake_summary']})"
-                        if writer_output["mistake_summary"]
-                        else writer_output["plan"]
-                    ),
-                    "evidence_steps": writer_output["evidence_steps"],
-                    "plan": writer_output["plan"],  # kept raw for guided replay's memory_block
-                }
+        if writer_output is not None:
+            draft_sft_plan = {
+                "repair_target": (
+                    f"{writer_output['plan']}\n(mistake: {writer_output['mistake_summary']})"
+                    if writer_output["mistake_summary"]
+                    else writer_output["plan"]
+                ),
+                "evidence_steps": writer_output["evidence_steps"],
+                "plan": writer_output["plan"],  # kept raw for guided replay's memory_block
+            }
 
         # ROUTER_DISABLE_CONTENT_FEATURES (DESIGN.md section 14.3 ablation):
         # content is still drafted and committed exactly as above -- this only
@@ -386,17 +411,32 @@ def run_router_chain(
             # Content already exists from the draft above -- just keep the
             # parts this route actually needs and force the route field, same
             # as the old post-hoc override of whatever the writer LLM echoed.
+            #
+            # v6: the operation and target are the WRITER's, not hardcoded.
+            # Through v5 this pinned `memory_operation` to "add" and the target
+            # to None, which is why unbanning refine in the writer prompt alone
+            # would have changed nothing: whatever the writer chose was
+            # overwritten one function later, and the only `refine` that could
+            # ever reach the bank was the one the dedup rule forced. Fall back
+            # to "add" when the writer left it unset, since a memory-writing
+            # route with no operation is rejected outright by
+            # `validate_alloc_decision` as `invalid_operation`.
+            draft_operation = draft_decision.get("memory_operation") or "add"
             decision = {
                 "route": route,
                 "gap_type": draft_decision.get("gap_type"),
                 "route_rationale": draft_decision.get("route_rationale"),
-                "memory_operation": "add" if writes_memory(route) else None,
-                "target_memory_id": None,
+                "memory_operation": draft_operation if writes_memory(route) else None,
+                "target_memory_id": (
+                    draft_decision.get("target_memory_id")
+                    if writes_memory(route) and draft_operation in {"refine", "replace"}
+                    else None
+                ),
                 "memory": draft_memory if writes_memory(route) else None,
                 "sft_plan": draft_sft_plan if writes_sft(route) else None,
             }
             if writes_memory(route):
-                _dedup_against_active_bank(decision, bank)
+                _duplicate_diagnostics(decision, bank)
             record = {
                 "protocol": config.record_protocol,
                 "domain": group,

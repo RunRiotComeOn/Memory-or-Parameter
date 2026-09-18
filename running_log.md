@@ -96,6 +96,81 @@
 - **⚠️ APPWORLD_ROOT 必须隔离**：`train_router_selfreward.py` 生成的 AppWorld experiment 名字（`cheap_v4_iter{i}_b{b}_k{k}_self`）在 v5 和 v5_nofeat 两个 arm 之间**完全相同**，而 AppWorld 把 per-task DB / evaluation / logs 写在 `$APPWORLD_ROOT/experiments/outputs/<experiment_name>/tasks/<task_id>/`，两个 arm 的 task_id 也一样。两台机器共享 `/nas04`，如果都用默认的 `APPWORLD_ROOT=/nas04/yixuh/appworld_root`，就会并发写同一批 task 目录、互相踩 DB 和评测结果。所以本机改用 `APPWORLD_ROOT=/nas04/yixuh/appworld_root_nofeat`（`data/` 从原 root 整份拷了一份 194M，`experiments/outputs` 和 `.tmp` 全新空目录）。后续任何"同一脚本在两台机器上并行跑不同 arm"的实验都要记得这一条。
 - **状态**：进行中（预算与 §9 相同，~49.6h/iteration）。`git pull` 在本机失败（`No user exists for uid 1644066`，ssh 取不到 passwd entry），但工作区就是 §9 那台机器在写的同一份 NFS checkout，已经在最新 commit `cb7d00b` 上，不影响跑动。
 
+## 11. `probe_sft_repair_yield_gemini_teacher.py`（Gemini teacher 写修复计划，本机，已完成）
+
+- **改动**：`scripts/probe_sft_repair_yield.py` 的姊妹脚本，唯一变量是修复计划由谁写——原版是 qwen35-tau 自己给自己写（`appworld_sft_writer`），这版换成 **Gemini（`gemini-3.1-pro-preview`）当 teacher**，执行修复的 student agent 仍然是本机 qwen35-tau，只是替它起草计划的模型换了。计划文本仍然是自然语言、注入 `memory_block` 走 guided replay，不是脚本回放。
+  - 踩坑记录：`--teacher-model` 一开始猜的 `gemini-3-pro-preview` 返回 404（已停用），API 报错里直接给出替代型号 `gemini-3.1-pro-preview`，改过来后正常。
+- **题目**：跟原版完全一样的 33 道 `base_train_v2` 失败题（18 个不同模板），保证跟以后任何自写手版本的结果可比。
+- **产物目录**：`router_reward_v1/sft_repair_probe_gemini_v1/`，日志 `router_reward_v1/sft_repair_probe_gemini.log`。
+- **结果（33/33 全部跑完）**：
+  ```
+  self-healed（不用任何计划，control 重跑自己就过了）：9/33
+  真正还在失败的分母：24
+  Gemini teacher 救回：15/24 = 62.5%
+  被计划弄坏的（control 过了、repair 反而失败）：1
+
+  按难度：1(易) 4/6=67%　2(中) 6/7=86%　3(难) 5/11=45%
+  按原始终止方式：max_steps 2/4　repeated_truncation 0/1　task_completed 13/19=68%
+  ```
+  中途 18/33 时的中间值是 76.9%，后面进来的多是 difficulty=3 的难题，把最终数字拉到了 62.5%——难度越高救回率越低，方向符合预期。
+- **⚠️→✅ 缺的对照已经补上，见 §12**：写这节时自写手版本（`sft_repair_probe_v1/`）只跑完 1 道 repair，所以当时只能说"Gemini 效果不差"。现在自写手版已跑完，同 15 道题的配对比较是 **Gemini 8/15 vs 自写手 1/15**，"比自写手更好"这一点坐实了。
+
+## 12. `probe_sft_repair_yield.py`（自写手版修复产出率，本机，已完成）
+
+- **目的**：把整条 SFT route 赖以成立的那个数单独量出来——**给一道失败题一份修复计划，重跑能救回百分之几**。此前它埋在训练循环里，只对"router 恰好把 sft/both 路由到的失败题"可见，全部证据只有 v5 的 `2 replayed, 0 verified`，而那两条还是同一个 task 模板（`22cc237`）的变体，是轶事不是样本。
+- **改动**：跟 §11 的 Gemini 版**唯一变量**是写计划的人——这版由 qwen35-tau 自己写（`appworld_sft_writer.APPWORLD_SFT_WRITER_SYSTEM`），也就是让**失败的那个模型自己诊断自己**。执行修复的 student agent、33 道题、control arm、summary 结构全部相同。
+- **两个 arm，都在今天同一批服务端上跑**：
+  - `control`：原样重跑，**无记忆、无 guidance** —— 今天真实可比的分母。
+  - `repair`：同一道题，注入 writer 的修复计划。
+  - **control 不是可有可无的**：那 33 条失败记录来自 `base_train_v2`（2026-08-28），远早于 §11 两副本确定性 serving（09-12）。DESIGN.md §13 已确认跨配置绝对分数不可比（10-20pp），§7 那条更正就是因为拿旧配置的数比新配置栽过一次。拿今天的 guided replay 去比五周前的失败记录，是同一个错误再犯。
+- **参数**：k=1、temperature=0、固定 seed 20260822、`max_tokens=4096`（writer 与 agent 均为当天统一提升后的值）、副本 8010/8011（repair arm 双路并行，按索引奇偶分流；`--max-num-seqs 1` 保证并发请求排队而非拼 batch，确定性不受影响）。
+- **产物目录**：`router_reward_v1/sft_repair_probe_v1/`，日志 `router_reward_v1/sft_repair_probe_v1.log`。
+- **结果**：
+  ```
+  33 道 → writer 挂 5 道（见下）→ 评了 28 道
+  self-healed（今天无计划就通过）  11/33
+  真实分母（今天仍失败且已评）     17
+    RESCUED                        1  = 5.9%
+    仍失败                        16
+  本来能过的                       11
+    BROKEN（加计划反而挂）          9  = 82%
+    both pass                       2
+
+  按难度:  1→0/6   2→0/4   3→1/7
+  按原始终止: task_completed→1/13  max_steps→0/3  repeated_truncation→0/1
+  ```
+  唯一救回的是 `6104387_3`（difficulty 3，65 步→47 步，计划点名了 `show_song_library`/`show_album_library` 的分页处理）。**净账：1 道失败变成功，9 道成功变失败，净 −8。**
+
+### 12.1 与 §11 Gemini teacher 的配对比较（本节的主结论）
+
+取两边 **control 都失败、且两边都评出了 repair 结果**的同一批题，n=15：
+
+```
+self-writer 救回 1/15 =  7%
+gemini      救回 8/15 = 53%
+只有 Gemini 救回: 7 道   只有自写手救回: 0 道
+```
+
+**严格占优**：Gemini 救回了自写手救回的那一道，外加 7 道，没有任何一道是自写手赢的。7 个不一致配对全部同向，符号检验 p ≈ 0.008，在 n=15 下已经显著。BROKEN 数同样是一边倒：自写手 9，Gemini 1。
+
+**结论：guided replay 这个机制是有效的，失效的是"自己诊断自己"。** `appworld_sft_writer` 的 docstring 里那句刻意的设计选择——*"Same base model, no separately trained teacher -- this is a system prompt, not a fine-tuned component"*——正是瓶颈本身。模型在一道题上失败，恰恰说明它对这道题的理解有缺陷，再让它解释自己错在哪，得到的是同一个缺陷的二次表达。
+
+自写手为什么会**主动有害**（82% 破坏率），机制上也说得通：计划是照着五周前那次失败写的，而那次失败今天已有 33% 不复现。writer 在诊断一个当下并不存在的错误，然后把 agent 推上一条为错误前提设计的流程。Gemini 只有 1 例破坏，说明更强的教师能识别出"这次其实没什么大错"。
+
+### 12.2 顺带查出的两个问题
+
+**(a) writer 会在 JSON 字符串里做思维链，烧光预算。** 5 道题（`29caf6f_1/2/3`、`692c77d_1`、`d0b1f43_2`）三次换 seed 重采样全部失败。抓到原始响应：`finish_reason=length`、`completion_tokens=4096`、内容 18649 字符，`plan` 字段正常写完（约 1321 字符），然后 `mistake_summary` 的字符串一开就再没合上，模型在里面自言自语 17k 字符直到耗尽预算。
+
+根因：`enable_thinking=False` 关掉了推理通道，而 `response_format={"type":"json_object"}` 只约束"必须是合法 JSON"——**JSON 字符串内部可放任意长度文本，语法上没有任何收尾压力**，于是推理被写进了字段值。**加预算无用**（2048→4096 同样失败，只是啰嗦更久）。修法是换成带 `maxLength` 的真 JSON schema 让受约束解码机械地兜住（§11 的 Gemini 版本已经用了 `response_json_schema`，本地这条路反而是松的）。**尚未修。**
+
+同一条路径在训练流水线里也存在且是静默的：memory writer 用同一个 `json_chat`，跑飞后 `run_router_chain` 把该题记为 `status: "error"` 并 `continue`——**这道题从梯度里整个消失**（不进 `live_decisions`），只留一行 error 日志。v5_nofeat 的 160 条记录里命中 1 条（0.6%），**也是 `29caf6f_1`**。
+
+**(b) `base_train_v2` 的失败名单已严重过时。** 33 道里今天有 11 道（33%）无计划就通过；§11 的 control 独立测出 9 道（27%）。两次 control 差 2 道，量级与 §13 记录的跑间不确定性一致。成因仍三者混淆：08-28 至今的配置漂移、当天把 agent `max_tokens` 2048→4096、以及跑间不确定性。**影响面超出 SFT 这条线：今天之前测的所有基线都需要重新核对**，包括 `baseline_recheck` 的 0.4912 和 §7 的 G=8 0.5789（那两个数彼此同条件、结论仍自洽，但今后任何 4096 下的新数字都不能跟它们比）。
+
+### 12.3 必须标注的限制
+
+**k=1、temperature=0，是下界。** rejection-sampling SFT（STaR/RFT）这类方法的标准做法是每题采 k=4~16，靠分布尾部捞正例；温度为 0 且只采一次，等于只取了分布上的一个确定性点。n=17 下 5.9% 的 95% 置信区间约 0.1%~28%——能排除"三成以上"，分不清 5% 和 20%。**注意：正因为 k=1，"重试"必须改变 seed 或计划，否则同 seed 同温度会逐 token 复现同一条轨迹。** 训练循环目前没有任何重试：`replay_and_verify` 一次不中即放弃，且 replay seed 只含 `batch_idx`、不含 iteration，所以跨 iteration 的"第二次机会"在同一候选槽位上是空转。
+
 ---
 
 *后续每次新跑动，在此文件末尾追加一节，格式同上：reward 定义、关键参数、产物目录、结果。*

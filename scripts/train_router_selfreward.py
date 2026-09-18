@@ -171,6 +171,8 @@ def sample_k_candidates(
         builder_config = RouterBuilderConfig(
             output=cand_dir, record_protocol="cheap_reward_v4_decision",
             model=args.model, base_url=args.base_url, seed=20260822 + k,
+            sft_writer=args.sft_writer, teacher_model=args.teacher_model,
+            teacher_api_key_file=args.teacher_api_key_file,
         )
         result = run_router_chain(
             router_model, GROUP, batch_task_ids, trajectories, builder_config,
@@ -212,6 +214,8 @@ def run_validation_pass(router_model: RouterPolicy, iteration: int, task_ids: li
     builder_config = RouterBuilderConfig(
         output=val_dir, record_protocol="cheap_reward_v4_validation",
         model=args.model, base_url=args.base_url, seed=20260822,
+        sft_writer=args.sft_writer, teacher_model=args.teacher_model,
+        teacher_api_key_file=args.teacher_api_key_file,
     )
     result = run_router_chain(router_model, GROUP, task_ids, trajectories, builder_config, greedy=True)
     route_counts = Counter(d["route"] for d in result.decisions)
@@ -383,6 +387,18 @@ def main() -> None:
     parser.add_argument("--model", default="qwen35-tau")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--base-url-probe", default="http://127.0.0.1:8001/v1", help="second replica, used to parallelize self-evals across candidates now, not for a probe set")
+    parser.add_argument(
+        "--sft-writer", choices=("teacher", "self"), default="teacher",
+        help="who writes the sft repair/consolidation plan: 'teacher' (default, external Gemini "
+             "model) or 'self' (same base model that plays the task agent). See "
+             "appworld_sft_writer.py and running_log.md section 11 for the probe behind the default.",
+    )
+    parser.add_argument("--teacher-model", default="gemini-3.1-pro-preview", help="only used when --sft-writer teacher")
+    parser.add_argument(
+        "--teacher-api-key-file", type=Path,
+        default=Path("/nas04/yixuh/.config/continual-memory/gemini_api_key"),
+        help="only used when --sft-writer teacher",
+    )
     parser.add_argument("--yes", action="store_true", help="skip the pre-launch cost confirmation")
     args = parser.parse_args()
 

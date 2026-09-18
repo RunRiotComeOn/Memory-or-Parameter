@@ -32,7 +32,11 @@ TRAIN_TRIGGER_SIZE = 8  # accumulate this many newly VERIFIED examples, then ret
 
 def sft_candidates_from_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Committed sft/both decisions from one candidate's records: the ones
-    with an accepted repair plan worth replaying and possibly training on."""
+    with an accepted plan worth replaying and possibly training on.
+
+    v6 carries `previous_success` along so the replay knows whether the plan
+    repairs a failed attempt or consolidates a successful one -- since the
+    guard that made this list failures-only is gone, both kinds occur."""
     out = []
     for record in records:
         if record.get("sft_status") != "selected":
@@ -41,7 +45,11 @@ def sft_candidates_from_records(records: list[dict[str, Any]]) -> list[dict[str,
         plan_text = sft_plan.get("plan")
         if not plan_text:
             continue
-        out.append({"task_id": record["source_task_id"], "plan": plan_text})
+        out.append({
+            "task_id": record["source_task_id"],
+            "plan": plan_text,
+            "previous_success": bool(record.get("base_agent_success")),
+        })
     return out
 
 
@@ -61,6 +69,8 @@ def replay_and_verify(
         "--experiment-name", f"router_sft_replay_{task_id}", "--model", model, "--base-url", base_url,
         "--seed", str(seed),
     ]
+    if candidate.get("previous_success"):
+        cmd.append("--previous-success")
     result = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=1200)
     if result.returncode != 0 or not out_path.exists():
         return None

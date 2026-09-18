@@ -578,3 +578,31 @@ reasoning parser 吞掉 content、`custom_fact_extraction_prompt` 在 2.0.20 是
 已经不是瓶颈。真正未解的是 **13.5 的后半句：记忆内容本身没有正价值**。
 该做的是检查写手产出的记忆是什么、为什么对解题没用（例如是否只是重复 API 文档里已有的信息），
 而不是换第四种存储方案。
+
+## 15. SFT 修复计划的写手换成外部 teacher model，默认开（2026-09-18）
+
+`appworld_sft_writer.py` 现在有两个互相替代的写手，产出格式完全一样
+（`validate_writer_output` 的 `{"plan","mistake_summary","evidence_steps"}`），下游（guidance 注入、
+guided replay、router 特征哈希）不需要知道也不需要关心是谁写的：
+
+- `self`：跟 task agent 同一个基座模型（qwen35-tau），走本地 `ModelClient`，`APPWORLD_SFT_WRITER_SYSTEM`。
+- `teacher`（**新默认**）：外部 Gemini 模型（`generate_plan_with_teacher`，`google-genai` SDK），
+  `GEMINI_TEACHER_SYSTEM` 是同一套 branching 逻辑（`success` 字段决定是写"修复计划"还是"提炼已成功路径"）
+  的 Gemini 版本。
+
+**为什么默认换成 teacher**：running_log.md §11 的 `probe_sft_repair_yield_gemini_teacher.py` 在 33 道
+`base_train_v2` 失败题上测出 Gemini teacher 修复率 15/24 = 62.5%（分母是"control 组无引导重跑仍然失败"
+的真正denominator）。同一批题的自写手版本（`probe_sft_repair_yield.py`）**没有跑完**，只有 1 道题完整
+跑完 repair 且还是"计划把好使的搞坏了"，不能严格对比，但 teacher 的 62.5% 已经足够作为默认值的依据——
+之前 sft 路由完全没训练进去（DESIGN.md §14.4），有个能打的写手比没有强。
+
+**接入方式**：`RouterBuilderConfig` 新增 `sft_writer`（`"teacher"` 默认 / `"self"`）、`teacher_model`
+（默认 `gemini-3.1-pro-preview`——`gemini-3-pro-preview` 已经 404，是 API 报错里直接给出的替代型号）、
+`teacher_api_key_file`（默认 `/nas04/yixuh/.config/continual-memory/gemini_api_key`）。
+`train_router_selfreward.py` 对应加了 `--sft-writer`/`--teacher-model`/`--teacher-api-key-file` 三个 CLI
+参数，`router_bank_builder.run_router_chain` 里原来"self writer"那段直接分支成 `if config.sft_writer ==
+"teacher": ...else: ...`，两边失败都统一返回 `None`（`writer_output`），后续处理完全不用改。
+
+**已知代价**：teacher 分支是外部网络调用，比本地 vLLM 慢且依赖网络可用性；这台机器上 `import
+google.genai` 本身实测过要 2-3 分钟（NFS I/O 慢，不是包本身的问题），只在进程生命周期内发生一次
+（后续调用复用已导入的模块），但训练脚本每次重启都会重新付一次这个代价。
