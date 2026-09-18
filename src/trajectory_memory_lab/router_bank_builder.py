@@ -46,6 +46,7 @@ numeric summary of it.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -327,8 +328,20 @@ def run_router_chain(
                     "plan": writer_output["plan"],  # kept raw for guided replay's memory_block
                 }
 
-        draft_text = _draft_content_text(draft_memory, draft_sft_plan)
-        recent_changes_text = _recent_changes_text(bank, position, recent_window_tasks)
+        # ROUTER_DISABLE_CONTENT_FEATURES (DESIGN.md section 14.3 ablation):
+        # content is still drafted and committed exactly as above -- this only
+        # blanks what the ROUTER sees, isolating "does seeing real content
+        # help the routing decision" from everything else, which stays byte
+        # -for-byte identical between the two arms. Empty text hashes to the
+        # zero vector (`_hash_bag_of_words`), which is informationally the
+        # same as the feature not existing for a linear model: weight * 0 is
+        # 0 regardless of what the model learns for that dimension.
+        if os.environ.get("ROUTER_DISABLE_CONTENT_FEATURES"):
+            draft_text = ""
+            recent_changes_text = ""
+        else:
+            draft_text = _draft_content_text(draft_memory, draft_sft_plan)
+            recent_changes_text = _recent_changes_text(bank, position, recent_window_tasks)
 
         features = features_of(trajectory, bank, recent_changes_text, draft_text)
         if greedy:

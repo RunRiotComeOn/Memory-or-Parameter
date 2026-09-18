@@ -107,10 +107,25 @@ def _restore_base_servers() -> None:
     partway through, router_sft_lora_update.sh may have already killed one or
     both replicas. Rather than guess which state it left them in, force both
     back onto the known-good, untrained base checkpoint -- serving something
-    correct beats leaving the training loop's only inference backends down."""
+    correct beats leaving the training loop's only inference backends down.
+
+    Session names/ports/GPUs mirror router_sft_lora_update.sh's own
+    SERVER_A_*/SERVER_B_* env var overrides, for the same reason: this
+    machine's det_server_a/b may not be at the 8000/8001, 0,1/2,3 defaults
+    (e.g. those ports already taken by someone else on a shared box)."""
     for name, cuda, port, cache in (
-        ("det_server_a", "0,1", "8000", "/tmp/appworld-det-server-cache-a"),
-        ("det_server_b", "2,3", "8001", "/tmp/appworld-det-server-cache-b"),
+        (
+            os.environ.get("SERVER_A_NAME", "det_server_a"),
+            os.environ.get("SERVER_A_GPUS", "0,1"),
+            os.environ.get("SERVER_A_PORT", "8000"),
+            "/tmp/appworld-det-server-cache-a",
+        ),
+        (
+            os.environ.get("SERVER_B_NAME", "det_server_b"),
+            os.environ.get("SERVER_B_GPUS", "2,3"),
+            os.environ.get("SERVER_B_PORT", "8001"),
+            "/tmp/appworld-det-server-cache-b",
+        ),
     ):
         subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
         subprocess.run([

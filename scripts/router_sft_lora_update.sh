@@ -26,20 +26,32 @@ base_model_path="/nas04/yixuh/hf_cache/hub/models--Qwen--Qwen3.5-35B-A3B/snapsho
 adapter_dir="$work_dir/lora_adapter"
 merged_dir="$work_dir/merged"
 
-for name in det_server_a det_server_b; do
+# All machine-specific (tmux session names, ports, GPU indices) -- override
+# these when det_server_a/b aren't at this machine's default ports/GPUs (e.g.
+# a shared box where 8000/8001 are already taken by someone else).
+server_a_name="${SERVER_A_NAME:-det_server_a}"
+server_b_name="${SERVER_B_NAME:-det_server_b}"
+server_a_port="${SERVER_A_PORT:-8000}"
+server_b_port="${SERVER_B_PORT:-8001}"
+server_a_gpus="${SERVER_A_GPUS:-0,1}"
+server_b_gpus="${SERVER_B_GPUS:-2,3}"
+train_gpus="${TRAIN_GPUS:-$server_b_gpus}"
+train_nproc="${TRAIN_NPROC:-2}"
+
+for name in "$server_a_name" "$server_b_name"; do
   if ! tmux has-session -t "$name" 2>/dev/null; then
     echo "$name tmux session not found -- refusing to guess GPU state, aborting" >&2
     exit 1
   fi
 done
 
-echo "[router_sft_lora_update] pausing det_server_b to free GPUs 2,3 for training"
-tmux kill-session -t det_server_b
+echo "[router_sft_lora_update] pausing $server_b_name to free GPUs $train_gpus for training"
+tmux kill-session -t "$server_b_name"
 
 export HF_HOME="${HF_HOME:-/nas04/yixuh/hf_cache}"
 export USE_HF=1
-export CUDA_VISIBLE_DEVICES="2,3"
-export NPROC_PER_NODE="2"
+export CUDA_VISIBLE_DEVICES="$train_gpus"
+export NPROC_PER_NODE="$train_nproc"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/router-sft-lora-triton-cache}"
 
@@ -78,22 +90,22 @@ if [[ -z "$checkpoint_dir" ]]; then
   exit 1
 fi
 
-echo "[router_sft_lora_update] pausing det_server_a; merging LoRA into a standalone checkpoint (CPU, no GPU needed)"
-tmux kill-session -t det_server_a
+echo "[router_sft_lora_update] pausing $server_a_name; merging LoRA into a standalone checkpoint (CPU, no GPU needed)"
+tmux kill-session -t "$server_a_name"
 rm -rf "$merged_dir"
 "$project_root/.venv/bin/python" "$project_root/scripts/merge_qwen_lora.py" \
   "$base_model_path" "$checkpoint_dir" "$merged_dir"
 
-echo "[router_sft_lora_update] reloading det_server_a (GPUs 0,1, port 8000) and det_server_b (GPUs 2,3, port 8001) on the merged checkpoint"
-tmux new-session -d -s det_server_a \
-  "CUDA_VISIBLE_DEVICES=0,1 MODEL_PATH=$merged_dir PORT=8000 TENSOR_PARALLEL_SIZE=2 GPU_MEMORY_UTILIZATION=0.85 TRITON_CACHE_DIR=/tmp/appworld-det-server-cache-a \
-   $project_root/scripts/serve_appworld_deterministic.sh 2>&1 | tee -a $project_root/appworld_experiment/det_server_a.log"
-tmux new-session -d -s det_server_b \
-  "CUDA_VISIBLE_DEVICES=2,3 MODEL_PATH=$merged_dir PORT=8001 TENSOR_PARALLEL_SIZE=2 GPU_MEMORY_UTILIZATION=0.85 TRITON_CACHE_DIR=/tmp/appworld-det-server-cache-b \
-   $project_root/scripts/serve_appworld_deterministic.sh 2>&1 | tee -a $project_root/appworld_experiment/det_server_b.log"
+echo "[router_sft_lora_update] reloading $server_a_name (GPUs $server_a_gpus, port $server_a_port) and $server_b_name (GPUs $server_b_gpus, port $server_b_port) on the merged checkpoint"
+tmux new-session -d -s "$server_a_name" \
+  "CUDA_VISIBLE_DEVICES=$server_a_gpus MODEL_PATH=$merged_dir PORT=$server_a_port TENSOR_PARALLEL_SIZE=2 GPU_MEMORY_UTILIZATION=0.85 TRITON_CACHE_DIR=/tmp/appworld-det-server-cache-a \
+   $project_root/scripts/serve_appworld_deterministic.sh 2>&1 | tee -a $project_root/appworld_experiment/${server_a_name}.log"
+tmux new-session -d -s "$server_b_name" \
+  "CUDA_VISIBLE_DEVICES=$server_b_gpus MODEL_PATH=$merged_dir PORT=$server_b_port TENSOR_PARALLEL_SIZE=2 GPU_MEMORY_UTILIZATION=0.85 TRITON_CACHE_DIR=/tmp/appworld-det-server-cache-b \
+   $project_root/scripts/serve_appworld_deterministic.sh 2>&1 | tee -a $project_root/appworld_experiment/${server_b_name}.log"
 
 echo "[router_sft_lora_update] waiting for both replicas to come back up..."
-for port in 8000 8001; do
+for port in "$server_a_port" "$server_b_port"; do
   for _ in $(seq 1 60); do
     if curl -s -m 3 "http://127.0.0.1:$port/v1/models" >/dev/null 2>&1; then
       echo "[router_sft_lora_update] port $port ready"
