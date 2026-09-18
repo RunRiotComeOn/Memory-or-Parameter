@@ -61,7 +61,7 @@ GROUP = "appworld"
 TRAIN_ROLLOUT = ROOT / "appworld_experiment/base_train_v2"
 PROBE_BASELINE_ROLLOUT = ROOT / "appworld_experiment/noise_serial_v1/run_a"
 PROBE_SET_SIZE = 15  # only used for the end-of-iteration validation split now, not training
-OUTPUT_ROOT = ROOT / "router_reward_v1/cheap_train_v5"
+OUTPUT_ROOT = ROOT / os.environ.get("ROUTER_OUTPUT_DIR", "router_reward_v1/cheap_train_v5")
 CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
 TRAIN_LOG = OUTPUT_ROOT / "train_log.jsonl"
 
