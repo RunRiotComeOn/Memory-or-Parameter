@@ -62,24 +62,37 @@
   - **⚠️ 2026-09-18 追加，重要更正**：DESIGN.md §13（另一台机器的三方后端对比）证实**跨副本/跨运行的绝对分数不可比，差距可达 10-20pp**。核对发现这里用来说"超过基线"的 0.4386 来自 `noise_serial_v1/run_a`，生成于 **2026-08-29**——比 §11 搭建两副本确定性 serving（2026-09-12）还早，几乎肯定不是同一套服务端配置；而 0.5789 是在这次两副本里的 `127.0.0.1:8000` 上测的。**这俩数字不能直接比**，"G=8 超过基线"这个结论目前**不成立，需要重新验证**。已经在同一个副本（8000 端口，同 seed=20260822，同 57 题 dev）上补跑一次匹配的无记忆基线（`router_reward_v1/baseline_recheck/`）。
   - **✅ 2026-09-18 同条件复核结果**：同副本（127.0.0.1:8000）无记忆基线 `pass_rate = 0.4912`（28/57）。G=8 的 0.5789（33/57）与它同副本、同 seed、同 57 题——**这次是真正可比的对照，G=8 确实比无记忆基线高 8.77 个百分点**，"router 学到的路由/记忆内容有正效果"这个结论目前站得住（n=1 次 iteration，仍需更多次跑动验证是否稳定）。
 
-## 6. `train_router_selfreward.py` + 熵正则（v4，另一台机器在跑）
+## 6. `train_router_selfreward.py` + 熵正则（已取消）
 
 - **改动**：在 loss 里加熵正则项 `loss = pg_term − entropy_coef × entropy_sum`（`entropy_coef` 默认 0.01），直接鼓励 route 分布不要过早收敛成确定性策略；同时把 `lr` 从 0.05 降到 0.01。验证阶段（贪心）也顺手记录 `mean_entropy`，即使 argmax 还没变、也能提前看到底层分布在不在塌。
 - **动机**：v2、v3(G=4) 两次独立训练（不同 reward 定义）都坍塌成确定性策略，且实测 v3(G=4) 的采样熵从 1.14 nats 掉到 0.65 nats（4 分类最大熵 ln4≈1.386）——判定是训练动力学问题（无正则、更新次数少、线性模型容易饱和），不是换 reward 定义能单独解决的。
 - **产物目录**：`router_reward_v1/cheap_train_v4/`（另一台机器写，共享此 NFS 目录）
-- **状态**：进行中。
+- **状态**：已取消。
 
-## 8. 2026-09-18 代码改动（尚未开始正式训练）
+## 8. 2026-09-18 代码改动（v5，详细动机见 DESIGN.md §14）
 
-三处相关改动，详细动机见 DESIGN.md §14：
+三处相关改动：
 
-1. **reward**：GRPO advantage 改成含无记忆基线的 K+1 路组内均值（`train_router_selfreward.py`），修复了此前 `self_baseline` 在代数上被组内均值抵消、从未真正进入梯度的 bug。
-2. **router 特征**：`FEATURE_DIM` 从 5 变 35。删掉 `frac_position`/`frac_remaining`（对固定 90 题的线性模型是精确冗余）。新增两块哈希词袋特征——最近两个 batch bank 新增/变动条目的实际文本、这道题已起草候选内容的实际文本。配套把 `router_bank_builder.run_router_chain` 改成"先起草内容、router 再看草稿决定路由"，而不是先路由再让 LLM 照写。代价：每道题都要起草一次内容，包括最后路由是 `neither` 的题。
-3. **SFT 真正训练进去**：以前 `sft_plan` 只记一句 `repair_target`，从未被消费——route=sft 和 route=neither 在 reward 上完全等价。现在换专门的 `appworld_sft_writer`（同一个基座模型换 prompt，不是教师模型）产出自然语言修复计划，只在失败题上调用；委托 `scripts/run_appworld_guided_replay.py` 把计划当 `memory_block` 注入、在真实环境里重新跑一次这道题，只有 AppWorld 自己判定成功的 replay 才把**真实对话记录**存进训练池；池子跨过 8 的倍数就触发 `scripts/router_sft_lora_update.sh`（LoRA 训练 + merge + 两个副本都重载新 checkpoint，保持副本对等）。
+1. **reward**：先改成含无记忆基线的 K+1 路组内均值（修复此前 `self_baseline` 在代数上被组内均值抵消、从未真正进入梯度的 bug），**后又撤回**——代数展开发现基线在 K+1 均值里只占 `1/(K+1)` 权重，K=8 时只有 1/9，信号被稀释得太弱，方向对但强度可能不够。当前用回最原始的纯组内相对 advantage（`advantage_k = pass_k - mean_j(pass_j)`），`self_baseline`/`rewards` 只做日志展示，不进梯度。还没想到更好的加权方式，先不加。
+2. **router 特征**：`FEATURE_DIM` 从 5 变 35。删掉 `frac_position`/`frac_remaining`（对固定 90 题的线性模型是精确冗余）。新增两块哈希词袋特征——最近两个 batch bank 新增/变动条目的实际文本、这道题已起草候选内容的实际文本。配套把 `router_bank_builder.run_router_chain` 改成"先起草内容、router 再看草稿决定路由"，而不是先路由再让 LLM 照写。代价：每道题都要起草一次内容，包括最后路由是 `neither` 的题。新增 `ROUTER_DISABLE_CONTENT_FEATURES=1` 开关，可以让这两块特征归零（对线性模型等价于特征不存在），用于对照实验，不用复制代码。
+3. **SFT 真正训练进去**：以前 `sft_plan` 只记一句 `repair_target`，从未被消费——route=sft 和 route=neither 在 reward 上完全等价。现在换专门的 `appworld_sft_writer`（同一个基座模型换 prompt，不是教师模型）产出自然语言修复计划，只在失败题上调用；委托 `scripts/run_appworld_guided_replay.py` 把计划当 `memory_block` 注入、在真实环境里重新跑一次这道题，只有 AppWorld 自己判定成功的 replay 才把**真实对话记录**（已把 guidance 文本从训练样本里切掉，避免训练/推理提示不一致）存进训练池；池子跨过 8 的倍数就触发 `scripts/router_sft_lora_update.sh`（LoRA 训练 + merge + 两个副本都重载新 checkpoint，保持副本对等；训练子进程用独立进程组跑，超时/失败会整组 kill 并自动把两个副本拉回未微调的 base 模型，不会留下服务器全挂的状态）。
+4. 预算估算加上了 sft guided-replay 和 LoRA 重训的粗略耗时（标了 UNVERIFIED，这条链路还没真正跑过）。
 
-**尚未验证过一次真实端到端**——下次正式训练如果真的触发了 SFT 训练，要盯着看两个副本是否正常重新起来。
+**已知未修的问题（不是这次要解决的）**：`self_baseline` 一旦某次 SFT 训练真的触发，后面所有 batch 用的都是微调后的 agent，但 baseline 还是原始 base agent 的分数，比较会悄悄失真，目前没有自动重新测基线的逻辑。
 
-⚠️ 同一天还有一个重要更正：§7 记的"G=8 超过基线"不成立，见 §7 末尾追加的说明——0.4386 这个基线来自跨副本/跨运行的旧数据，和 0.5789 不可比。已在 G=8 用的同一个副本上补跑匹配基线（`router_reward_v1/baseline_recheck/`），跑完后补记结果。
+## 9. `train_router_selfreward.py` v5（本机在跑，2026-09-18 06:29 UTC 启动）
+
+- **改动**：§8 的三处改动全部生效后的第一次正式训练。
+- **参数**：K=8，B=9，lr=0.01，entropy_coef=0.01，`--base-url` 8000/8001（本机两个确定性副本）。
+- **产物目录**：`router_reward_v1/cheap_train_v5/`，日志 `router_reward_v1/train_v5.log`，tmux session `train_router_v5`。
+- **状态**：进行中，预计约 49.6h/iteration（42h self-eval + ~2.1h sft guided-replay + ~2h LoRA 重训，后两项是没跑过的估计）。
+
+## 10. `train_router_selfreward.py` v5_nofeat 消融（另一台机器，与 §9 同时起跑）
+
+- **改动**：唯一变量 `ROUTER_DISABLE_CONTENT_FEATURES=1`——router 看到的两块哈希内容特征强制归零，内容照样起草/写入，只是不给 router 当特征看。其余参数与 §9 完全一致（K=8、lr=0.01、entropy_coef=0.01、reward 公式、SFT 训练开关）。
+- **目的**：判断今天新加的"router 能看到实际内容"这个改动（§8.2）到底有没有用——这是今天成本最高（每题多一次起草调用）但从没验证过的改动。
+- **产物目录**：`router_reward_v1/cheap_train_v5_nofeat/`（`ROUTER_OUTPUT_DIR` 环境变量指定，跟 §9 共享同一份 NFS 代码但输出目录不冲突）。
+- **状态**：待另一台机器确认本地两个副本端口/GPU 后启动。
 
 ---
 
