@@ -60,7 +60,7 @@ def main() -> None:
 
     common_args = {
         "temperature": 0.0,
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "api_base": "http://127.0.0.1:8000/v1",
         "api_key": "EMPTY",
         "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},

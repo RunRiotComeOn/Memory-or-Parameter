@@ -158,7 +158,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=731)
     parser.add_argument("--sources-per-domain", type=int, default=3)
     parser.add_argument("--candidates-per-source", type=int, default=3)
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--save-prefix", default="qwen35_mw_utility_v3")
     parser.add_argument(
         "--rubric-smoke",

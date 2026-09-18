@@ -115,7 +115,7 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--max-parallel", type=int, default=4)
     parser.add_argument("--max-steps", type=int, default=40)
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--seed", type=int, default=20260822)
     args = parser.parse_args()

@@ -208,8 +208,17 @@ def alloc_rubric_block(rubric_id: str) -> str:
 # router_reward_v1: the route is chosen by a learned classifier (see
 # src/trajectory_memory_lab/router_policy.py), not by the LLM. The writer's
 # only remaining job is to produce content for a route decided upstream --
-# it must not re-derive or override the route. Only `add` is available: the
-# router (DESIGN.md section 7) does not choose among refine/replace.
+# it must not re-derive or override the route.
+#
+# v6: the writer now picks `add` / `refine` / `replace` and its own target
+# itself. It always had what it needs to -- `render_bank(bank)` is in its
+# payload -- but was forbidden from using it, which meant `refine` could only
+# ever be produced after the fact by `_dedup_against_active_bank`, a Jaccard
+# threshold that overrode the operation, picked the target, and rewrote the
+# content. Choosing between add and refine is a judgment about what the bank
+# already says; that belongs to the model reading the bank, not to a rule
+# reading a similarity score. Legality is still enforced downstream by
+# `validate_alloc_decision` (unknown_target / missing_target / add_with_target).
 # ---------------------------------------------------------------------------
 
 _ROUTED_REQUIREMENTS = {
@@ -239,11 +248,17 @@ trajectory can hold a useful correction, but its failed conclusion must never be
 Do not paraphrase policy. Never include names, user IDs, phone numbers, emails, reservation or
 order IDs, or any value specific to this task. Cite exact trajectory message indexes.
 
-Memory operations: only `add` is available in this experiment. When a memory is required, set
-memory_operation to `add` and target_memory_id to null.
+Memory operations: choose the operation yourself, from the active memory bank you were given.
+`add` -- no active entry covers this ground. Set target_memory_id to null.
+`refine` -- an active entry is about the same thing but is incomplete or imprecise. Set
+target_memory_id to that entry's id. Superseding drops the target from retrieval, so your content
+must carry everything the target got right PLUS what it was missing; anything you leave out is lost.
+`replace` -- an active entry is wrong and should not survive. Same targeting rule.
+Prefer `refine` over `add` when adding would leave two active entries saying nearly the same thing:
+near-duplicates compete for the same retrieval slots and crowd out unrelated memories.
 
 Return exactly one JSON object:
-{{"route":"{route}","gap_type":"knowledge"|"procedure"|"both"|"none","route_rationale":STRING,"memory_operation":"add"|null,"target_memory_id":null,"memory":{{"content":STRING,"scope":STRING,"conditions":[STRING,...],"exceptions":[STRING,...],"evidence_steps":[INTEGER,...],"confidence":NUMBER}}|null,"sft_plan":{{"repair_target":STRING,"evidence_steps":[INTEGER,...]}}|null}}
+{{"route":"{route}","gap_type":"knowledge"|"procedure"|"both"|"none","route_rationale":STRING,"memory_operation":"add"|"refine"|"replace"|null,"target_memory_id":STRING|null,"memory":{{"content":STRING,"scope":STRING,"conditions":[STRING,...],"exceptions":[STRING,...],"evidence_steps":[INTEGER,...],"confidence":NUMBER}}|null,"sft_plan":{{"repair_target":STRING,"evidence_steps":[INTEGER,...]}}|null}}
 
 {FROZEN_WRITING_STYLE}
 """

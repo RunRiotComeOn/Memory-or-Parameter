@@ -48,7 +48,7 @@ class BuilderConfig:
     summary_protocol: str
     model: str = "qwen35-tau"
     base_url: str = "http://127.0.0.1:8000/v1"
-    max_tokens: int = 3072
+    max_tokens: int = 4096
     timeout: float = 1200
     seed: int = 20260822
     budget_fraction: float = 0.4

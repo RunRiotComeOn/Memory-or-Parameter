@@ -56,7 +56,7 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--model", default="qwen35-tau")
     parser.add_argument("--repeats", type=int, default=8)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=20260822)
     args = parser.parse_args()
 

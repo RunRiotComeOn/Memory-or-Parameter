@@ -243,7 +243,7 @@ def main() -> None:
         nargs="+",
         default=["qwen35-tau", "qwen35-tau-writer-sft-v2"],
     )
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--timeout", type=float, default=1200)
     parser.add_argument("--seed", type=int, default=1301)
     parser.add_argument("--max-parallel", type=int, default=4)

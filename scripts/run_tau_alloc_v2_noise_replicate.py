@@ -21,7 +21,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tag", default="rep2")
     parser.add_argument("--max-concurrency", type=int, default=2)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--timeout", type=int, default=2400)
     parser.add_argument("--seed", type=int, default=20260822)
     parser.add_argument("--memory-top-k", type=int, default=3)

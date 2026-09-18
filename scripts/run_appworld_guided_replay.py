@@ -39,9 +39,15 @@ def main() -> None:
     parser.add_argument("--model", default="qwen35-tau")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--max-steps", type=int, default=40)
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--seed", type=int, default=20260822)
+    # v6: the plan is a repair only when the previous attempt failed. Optional
+    # so a caller that predates the flag still gets the original wording.
+    parser.add_argument(
+        "--previous-success", action="store_true",
+        help="the attempt this plan came from SUCCEEDED; the plan consolidates it rather than repairing it",
+    )
     args = parser.parse_args()
 
     from appworld import AppWorld
@@ -61,7 +67,7 @@ def main() -> None:
         enable_thinking=False,
         timeout=args.timeout,
     )
-    guidance_text = guidance_block({"plan": args.guidance})
+    guidance_text = guidance_block({"plan": args.guidance}, previous_success=args.previous_success)
     try:
         with AppWorld(
             task_id=args.task_id, experiment_name=args.experiment_name, random_seed=args.seed,

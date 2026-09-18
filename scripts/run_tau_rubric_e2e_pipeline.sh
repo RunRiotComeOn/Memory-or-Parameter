@@ -104,7 +104,7 @@ stage "memory_generation:start"
 PYTHONPATH="$project_root/src:$project_root/scripts" "$project_root/.venv/bin/python" -u \
   "$project_root/scripts/generate_tau_rubric_memory_banks.py" \
   --manifest "$manifest" --output "$experiment/memory" \
-  --model qwen35-tau --max-parallel 3 --max-tokens 2048 --seed 20260822 \
+  --model qwen35-tau --max-parallel 3 --max-tokens 4096 --seed 20260822 \
   2>&1 | tee -a "$runtime/memory_generation.log"
 stage "memory_generation:complete"
 

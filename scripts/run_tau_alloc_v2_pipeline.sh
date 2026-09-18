@@ -46,7 +46,7 @@ PYTHONPATH="$project_root/src:$project_root/scripts" "$project_root/.venv/bin/py
   "$project_root/scripts/generate_tau_alloc_memory_banks_v2.py" \
   --manifest "$manifest" --output "$experiment/memory" \
   --model qwen35-tau --max-parallel-chains "$gen_max_parallel_chains" \
-  --max-tokens 3072 --seed 20260822 --budget-fraction 0.4 \
+  --max-tokens 4096 --seed 20260822 --budget-fraction 0.4 \
   2>&1 | tee -a "$runtime/alloc_generation.log"
 stage "alloc_generation:complete summary=$experiment/memory/summary.json"
 

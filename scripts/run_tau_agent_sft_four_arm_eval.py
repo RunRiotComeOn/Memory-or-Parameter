@@ -167,7 +167,7 @@ def main() -> None:
     parser.add_argument("--memory-dir", type=Path, required=True)
     parser.add_argument("--max-parallel-runs", type=int, default=3)
     parser.add_argument("--max-concurrency", type=int, default=2)
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--seed", type=int, default=300)
     parser.add_argument("--memory-top-k", type=int, default=3)

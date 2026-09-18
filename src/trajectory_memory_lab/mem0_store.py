@@ -100,7 +100,7 @@ def build_memory(
     model: str,
     *,
     embed_model: str = EMBED_MODEL,
-    max_tokens: int = 2048,
+    max_tokens: int = 4096,
 ) -> Memory:
     """A Memory whose LLM is our own deterministic vLLM replica."""
     store = Path(store_path)
