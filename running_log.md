@@ -91,8 +91,10 @@
 
 - **改动**：唯一变量 `ROUTER_DISABLE_CONTENT_FEATURES=1`——router 看到的两块哈希内容特征强制归零，内容照样起草/写入，只是不给 router 当特征看。其余参数与 §9 完全一致（K=8、lr=0.01、entropy_coef=0.01、reward 公式、SFT 训练开关）。
 - **目的**：判断今天新加的"router 能看到实际内容"这个改动（§8.2）到底有没有用——这是今天成本最高（每题多一次起草调用）但从没验证过的改动。
-- **产物目录**：`router_reward_v1/cheap_train_v5_nofeat/`（`ROUTER_OUTPUT_DIR` 环境变量指定，跟 §9 共享同一份 NFS 代码但输出目录不冲突）。
-- **状态**：待另一台机器确认本地两个副本端口/GPU 后启动。
+- **产物目录**：`router_reward_v1/cheap_train_v5_nofeat/`（`ROUTER_OUTPUT_DIR` 环境变量指定，跟 §9 共享同一份 NFS 代码但输出目录不冲突），日志 `router_reward_v1/train_v5_nofeat.log`，tmux session `train_router_v5_nofeat`。
+- **本机（第二台）实际配置**（2026-09-18 00:03 PDT 启动）：这台机器上 8000/8001/8002 已被别人的服务占用（8000 是另一个用户的 qwen3-vl vLLM，8001/8002 是别人的 judge_server），GPU 0/2/3 也有别人的进程。所以两个确定性副本改成 **8010（GPU 4,5）/ 8011（GPU 6,7）**，tmux session 名 `det_server_nofeat_a` / `det_server_nofeat_b`（不用默认的 `det_server_a/b`，否则会跟 §9 那台机器往同一份 NFS 日志 `appworld_experiment/det_server_a.log` 里混写）。训练进程里相应导出 `SERVER_A_NAME/SERVER_B_NAME/SERVER_A_PORT/SERVER_B_PORT/SERVER_A_GPUS/SERVER_B_GPUS`，这样 §8.3 的 SFT LoRA 重训 + 双副本重载（以及失败时的 `_restore_base_servers` 兜底）打的是本机真实的端口/GPU，不是 8000/8001 和 GPU 0,1/2,3。
+- **⚠️ APPWORLD_ROOT 必须隔离**：`train_router_selfreward.py` 生成的 AppWorld experiment 名字（`cheap_v4_iter{i}_b{b}_k{k}_self`）在 v5 和 v5_nofeat 两个 arm 之间**完全相同**，而 AppWorld 把 per-task DB / evaluation / logs 写在 `$APPWORLD_ROOT/experiments/outputs/<experiment_name>/tasks/<task_id>/`，两个 arm 的 task_id 也一样。两台机器共享 `/nas04`，如果都用默认的 `APPWORLD_ROOT=/nas04/yixuh/appworld_root`，就会并发写同一批 task 目录、互相踩 DB 和评测结果。所以本机改用 `APPWORLD_ROOT=/nas04/yixuh/appworld_root_nofeat`（`data/` 从原 root 整份拷了一份 194M，`experiments/outputs` 和 `.tmp` 全新空目录）。后续任何"同一脚本在两台机器上并行跑不同 arm"的实验都要记得这一条。
+- **状态**：进行中（预算与 §9 相同，~49.6h/iteration）。`git pull` 在本机失败（`No user exists for uid 1644066`，ssh 取不到 passwd entry），但工作区就是 §9 那台机器在写的同一份 NFS checkout，已经在最新 commit `cb7d00b` 上，不影响跑动。
 
 ---
 
