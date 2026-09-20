@@ -1,3 +1,6 @@
+# Claude Code local session state (lock files etc.), not project source
+.claude/
+
 # Virtual environments
 .venv/
 .train-venv/
@@ -27,6 +30,7 @@ runtime_logs/
 outputs/
 replay_runs/
 appworld_experiment/
+alfworld_experiment/
 tau_experiment/
 timewarp_*/
 router_reward_v1/*

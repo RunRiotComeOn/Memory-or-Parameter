@@ -606,3 +606,153 @@ guided replay、router 特征哈希）不需要知道也不需要关心是谁写
 **已知代价**：teacher 分支是外部网络调用，比本地 vLLM 慢且依赖网络可用性；这台机器上 `import
 google.genai` 本身实测过要 2-3 分钟（NFS I/O 慢，不是包本身的问题），只在进程生命周期内发生一次
 （后续调用复用已导入的模块），但训练脚本每次重启都会重新付一次这个代价。
+
+## 16. Router 变成可训练的 LLM：4 路 categorical，而不是自由生成（2026-09-18，router_llm_grpo_v1）
+
+把 router 从 144 参数的线性分类器（`router_policy.RouterPolicy`）换成一个 LoRA 可训练的小 LLM，
+reward / batch 结构 / advantage / 随机选候选延续 bank 这些全部沿用 `train_router_selfreward.py`，
+**只换"谁做决定"和"梯度打在哪"**。`train_router_selfreward.py` 一行没动，是并列实验不是替换。
+
+### 16.1 核心发现：这个动作空间不需要 vLLM，也不需要 LoRA 热加载
+
+交接文档给的方案是 RLHF 的标准三段式：vLLM 采样拿 token logprob → 本地 peft 副本 teacher-forcing
+重算可微 logprob → `POST /v1/load_lora_adapter` 把新权重同步回 vLLM。**这两个机制在本仓库的
+vLLM 0.17.1 上都确实存在**（已查证，不是假设）：
+
+- `entrypoints/serve/lora/api_router.py`：`POST /v1/load_lora_adapter`，需要
+  `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1`；配 `load_inplace: true` 会复用同一个 `lora_int_id`，
+  `lora/worker_manager.py:263` 那个 `or lora_request.load_inplace` 强制从磁盘重载并替换缓存里的
+  adapter——真的是热替换，不用重启 server。
+- `entrypoints/openai/chat_completion/protocol.py`：chat-completions 支持 `logprobs` /
+  `top_logprobs` / `prompt_logprobs`。
+
+但是**这套东西在这里是多余的，因为 router 的动作根本不是自由生成，是一次 4 选 1 的抽样**。
+
+把 assistant 轮强制以 `{"route": "` 开头，下一个 token 就已经唯一确定了 route。实测 Qwen 分词器
+（`_assert_route_tokens` 在构造时对真实 tokenizer 断言，不是假设）：
+
+```
+prefix '{"route": "' -> [4913, 8966, 788, 330]
+memory  -> 17269  (单 token)
+sft     -> 82 's' + 723 'ft'
+both    -> 21028  (单 token)
+neither -> 811 'ne' + 2485 'ither'
+```
+
+`sft` 和 `neither` 虽然是两个 token，但**首 token 两两不同**（17269 / 82 / 21028 / 811），所以在这
+一个位置上对这 4 个 logit 做 `log_softmax`，就是完整的策略：一次前向、可微、熵是精确的。这和
+`router_policy.sample_action` 里的 `Categorical` 是同一个东西，只是 logits 来自 LLM 而不是
+`nn.Linear`。
+
+于是整个采样/重算/同步的问题一起消失：
+
+1. **router 不用 vLLM。** 每个决策 ~0.2s，一个 batch 80 个决策 ≈ 1-2 分钟，而同一个 batch 的
+   AppWorld self-eval 是 ~5.8 小时（K=8，2 路并行，70min/次）。推理引擎在这里没有任何可优化的东西。
+2. **采样和梯度用同一份权重**，所以重算出来的 logprob 不是"接近"采样时的值，**就是同一个值**。
+   `verify_recompute_matches_sample` 直接按 1e-3 断言，实测 `|diff| = 0.00e+00`。跨引擎比较永远做
+   不到这么严——它必须容忍的那点误差，恰好能盖住"replay 了错的 prompt""存错了 route index"这类
+   真 bug。
+3. **`optimizer.step()` 之后没有任何东西需要同步**，没有热加载，没有采样器和学习器不一致的窗口。
+4. 省下一张卡（原方案里 router 的 vLLM serving）。
+
+**代价，明说**：router 不能先推理再决定。但**今天这一条代价是 0**——`router_llm_policy.
+ROUTER_LLM_SYSTEM` 要求的输出是 `{"route": ..., "rationale": ...}`，`rationale` 在 `route` **之后**
+生成，本来就影响不了决策，纯粹是日志。要做 reason-then-decide 得把 vLLM 那条路加回来，而且训练目标
+要在"含 rationale 的 logprob"（~100+ token，方差大，而一次 iteration 只有 9 步梯度）和"只算 route
+token"（有偏的部分梯度）之间选一个；目前没有任何测量说 CoT 对这个 4 选 1 判断有帮助，所以不做。
+
+system prompt 和 payload 直接从 `router_llm_policy` 原样 import，没有另写一套——这样
+`run_router_llm_probe.py` 那个未训练的 route 分布才是这次训练真正的 step-0 基线，而不是一个换了
+提示词的表亲。
+
+### 16.2 显存约束下的两段式：采样丢图，更新时重算
+
+一个 batch 有 K=8 × 10 = 80 个决策。**不能**像线性 router 那样把 80 个 logprob 挂在图上求和再一次
+backward——那是 80 张 8B 模型的前向图，装不下。所以：
+
+- **采样阶段**（`torch.no_grad()`）：只记 `prompt_ids` + 选中的 `index`（`SampledDecision`），
+  probs/entropy 存 detach 到 CPU 的副本做诊断。不留图。
+- **更新阶段**：逐个决策重放前向（带梯度），`term = -(adv * logprob) - coef * entropy`，
+  **逐个 backward 累加** `.grad`，最后一次 `optimizer.step()`。
+
+逐个 backward 和"求和后一次 backward"在数学上完全等价（和的导数等于导数的和），但同时只需要驻留
+一张前向图。loss 的形状和 `train_router_selfreward.run_one_batch_update` 逐字对应，entropy 项也仍然
+是在"所有候选 × 所有决策"上求和，所以 v4 标定出来的 `entropy_coef=0.01` 的量级不用重调。
+
+### 16.3 探索够不够：一个差点看错的测量
+
+GRPO 要求 K 个候选真的会做出**不同**的决策。如果策略太确定，8 个候选决策完全一样 → `pass_k` 全同 →
+advantage 全是 0 → 梯度是 0，而**日志看起来完全正常**，可以这样空转 40 小时。所以开工前先量。
+
+第一次量出来的结论是错的，记下来因为很容易再犯：拿 `cheap_train_v5` 的真实 record 当输入，测出
+Qwen3-1.7B 平均熵只有 0.073 nats、Qwen3-8B 只有 0.037 nats，且 `sft`/`both` 概率≈0，看起来是彻底
+坍缩。**但那 20 条 record 里有 0 条同时带 memory 和 sft 两个草稿**（19 条只有 memory）——payload 里
+`drafted_sft_plan_candidate: null`，那 `sft`/`both` 本来就没东西可提交，给它们 0 概率是**正确**判断，
+不是坍缩。这是典型的"对照没搭对就读出了结论"，和 §13.1 那三条是同一类错误。
+
+补上真实的 Gemini 修复计划（`sft_repair_probe_gemini_v1/plans.json`）让四个 route 都真正可选之后，
+同一批任务重测（n=20，T 是给 4 个 route logit 做 softmax 前的温度）：
+
+| 模型 | T | 平均熵 (nats) | p(argmax) | P(8 个候选完全相同) | 平均 route 概率 | argmax 分布 |
+|---|---|---|---|---|---|---|
+| Qwen3-1.7B | 1.0 | 0.312 | 0.865 | ~0.0000 | mem .064 / sft .131 / both .049 / neither .755 | neither 15, sft 3, memory 2 |
+| Qwen3-8B | 1.0 | 0.154 | 0.931 | 0.0033 | mem .177 / sft .000 / both .136 / neither .686 | neither 13, memory 4, both 3 |
+| Qwen3-8B | 3.0 | 0.417 | 0.832 | ~0.0000 | mem .190 / sft .003 / both .131 / neither .676 | 同上 |
+
+两个模型在 T=1.0 都有足够探索（8B 是 99.7% 的 batch 会出现分歧），不需要调温度。
+
+**反直觉的一条，值得单独记**：模型越大越确定、探索越少（8B 的熵只有 1.7B 的一半）。"大模型基础判断
+更好"这个直觉在这里要和"大模型更不肯探索"对冲，不是单向的。
+
+**选 Qwen3-8B**，理由是基础判断质量本来就是换掉 1.7B 的唯一动机，而探索量（P=0.003）够用。
+**已知缺口**：8B 在 T=1.0 下几乎不单独选 `sft`（p≈0.000），虽然通过 `both`（p=0.136）仍然会提交 sft
+产物。纯 `sft` 这个动作实际上是半死的，靠熵正则和训练能不能救回来，留作观察项。
+`policy_temperature` 作为配置项保留（默认 1.0），是运行中发现坍缩时唯一不动权重就能加宽探索的杠杆。
+
+### 16.4 学习率：实测出来的问题和预期相反
+
+交接文档担心的是"lr=0.01 是给 144 参数线性模型调的，对 LoRA 肯定不对"，并提示 LoRA 常用 1e-4~1e-5。
+实测（`smoke_router_llm_policy_gradient.py` 的扫描，单个决策、advantage=+1.0 反复推）方向是反的：
+**1e-4 太大，不是太小。**
+
+| lr | 一步之后 Δp(route) | 9 步之后 p(route) |
+|---|---|---|
+| 1e-6 | -1.0e-13 | 0.00000 |
+| 1e-5 | +5.4e-10 | 0.86551 |
+| 5e-5 | +5.8e-06 | 1.00000 |
+| 1e-4 | **+9.7e-01** | 1.00000 |
+| 5e-4 | +1.0e+00 | 1.00000 |
+
+lr=1e-4（就是本仓库 `train_qwen_lora.sh` 的 SFT 学习率）**一步就把某个 route 的概率从 0.00000 推到
+0.949**；同样的 lr 下熵正则也发散——10 步之后熵从 0.113 掉到 0.0001（完全坍缩），而不是升向均匀。
+注意这不是符号错：lr 从 1e-7 到 3e-5 熵都是**上升**的（0.113 → 0.149 / 0.425 / 0.686 / 0.792），
+只有 1e-4 炸掉。所以那次 smoke 的 FAIL 是步长问题，不是梯度方向问题。
+
+动力学高度非线性，原因是 LoRA 的 B 初始化为 0：前几步几乎不动（`delta` 在 1e-10 量级），B 一旦起来
+就非常快。所以"一步移动多少"和"九步移动多少"完全不是线性关系，只看单步会严重低估。
+
+**定 lr=1e-5**，并且默认开 `--max-grad-norm 1.0`。开 clipping 的理由不是常规保险，而是这里
+**一次 iteration 只有 9 次更新，没有从一次坏更新里恢复的机会**，而 §12 已经确认坍缩掉的 router 只能
+重新初始化、不能靠继续训练爬回来。真实 batch 的 advantage 是 80 个混合符号的决策，净推力远小于上表
+那种"同一个决策连推 9 次"的最坏情况，所以 1e-5 可能还偏小——`train_log.jsonl` 每个 batch 记
+`mean_prob_shift` / `max_prob_shift` / `grad_norm`，第一个真实 batch 之后按这几个数再定。
+
+### 16.5 冒烟测试（都在真实训练启动之前跑过并通过）
+
+- `scripts/smoke/smoke_router_llm_logprob.py`：分词器四路可区分、prompt 与 `decide_route` 逐字节
+  一致、分布良构（概率和为 1、熵在 [0, ln4]）、**重算 logprob == 采样 logprob**（实测 |diff|=0）、
+  梯度只进 LoRA 不进 base（0 个 base 张量带梯度）。
+- `scripts/smoke/smoke_router_llm_policy_gradient.py`：正 advantage 抬高该 route 概率、负 advantage
+  压低、只有 LoRA 权重变、熵正则把熵从 0.113 推到 1.017 nats、以及 §16.4 的 lr 扫描。
+- `scripts/smoke/smoke_router_llm_batch_e2e.py`：只 stub 三个边界（writer LLM、AppWorld 评测子进程、
+  sft guided replay），跑**真实的** `run_one_batch_update`——每个决策都带 `SampledDecision`（确认真的
+  走了 `trained_llm` 模式，没有静默退化成零张量）、advantage 组内和为 0（实测 1.1e-16）、候选确实分
+  歧、LoRA 真的动、诊断字段齐全。
+
+**这里踩到一个 stub 设计的坑**：第一版 stub 的记忆内容是 `"stub memory fact number 3 about topic 3"`
+这种占位文本，router 以概率 1.0 判 `neither`——这是**对垃圾内容的正确判断**，但它让熵、logprob、梯度
+全变成 0，那条"候选是否分歧"的断言就变得没有意义了。stub 内容必须和 `routed_writer_system` 真实产出
+同构（具体的 API 事实 + 具体的修复步骤）才测得到东西。另外那条断言本身也和规模有关：在测试用的
+K=4 × batch_size=4、p(argmax)=0.99 下，16 个决策全同的概率本来就有 ~85%，所以断言分歧等于在测
+batch size；真正的探索量是 §16.3 在真实规模上单独量的，e2e 这边把温度设成 3.0，测的是"有熵的时候
+分歧能不能传到 advantage 和梯度"这条通路。

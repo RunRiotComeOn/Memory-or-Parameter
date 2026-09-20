@@ -64,6 +64,15 @@ PROBE_SET_SIZE = 15  # only used for the end-of-iteration validation split now, 
 OUTPUT_ROOT = ROOT / os.environ.get("ROUTER_OUTPUT_DIR", "router_reward_v1/cheap_train_v5")
 CHECKPOINT_DIR = OUTPUT_ROOT / "checkpoints"
 TRAIN_LOG = OUTPUT_ROOT / "train_log.jsonl"
+# Crash recovery (added after a shared-NFS outage silently killed a ~10.5h run
+# with zero checkpoints -- save_checkpoint used to only fire once per full
+# iteration). RESUME_STATE_PATH + the "latest" checkpoint are overwritten
+# after EVERY batch, not just at iteration boundaries, so a killed process
+# loses at most one batch's work, not up to 8. Deliberately separate from
+# router_iter{N}.pt (only written when iteration N is fully done): that file
+# is what decides which iteration a fresh launch starts on, and must keep
+# meaning "N is complete", not "N was in progress when we died".
+RESUME_STATE_PATH = OUTPUT_ROOT / "resume_state.json"
 
 APPWORLD_PYTHON = "/nas04/yixuh/appworld_venv/bin/python"
 APPWORLD_ROOT_DEFAULT = "/nas04/yixuh/appworld_root"
@@ -121,6 +130,17 @@ def split_batches(task_ids: list[str], batch_size: int) -> list[list[str]]:
     return [task_ids[i : i + batch_size] for i in range(0, len(task_ids), batch_size)]
 
 
+def load_resume_state() -> dict[str, Any] | None:
+    return read_json(RESUME_STATE_PATH) if RESUME_STATE_PATH.exists() else None
+
+
+def save_resume_state(iteration: int, next_batch_idx: int, canonical_bank: list[dict[str, Any]], position: int) -> None:
+    write_json(RESUME_STATE_PATH, {
+        "iteration": iteration, "next_batch_idx": next_batch_idx,
+        "canonical_bank": canonical_bank, "position": position,
+    })
+
+
 def launch_subset_eval(
     bank_path: Path, eval_dir: Path, experiment_name: str, task_ids: list[str] | None,
     split: str, model: str, base_url: str,
@@ -173,6 +193,12 @@ def sample_k_candidates(
             model=args.model, base_url=args.base_url, seed=20260822 + k,
             sft_writer=args.sft_writer, teacher_model=args.teacher_model,
             teacher_api_key_file=args.teacher_api_key_file,
+            # This script trains router_policy.RouterPolicy via GRPO -- it
+            # needs the real logprob/entropy from the trained linear router,
+            # not the new system-default LLM router (which has neither).
+            # Explicit so this script's behavior does not silently change if
+            # RouterBuilderConfig's default ever changes again.
+            router_mode="trained",
         )
         result = run_router_chain(
             router_model, GROUP, batch_task_ids, trajectories, builder_config,
@@ -216,6 +242,7 @@ def run_validation_pass(router_model: RouterPolicy, iteration: int, task_ids: li
         model=args.model, base_url=args.base_url, seed=20260822,
         sft_writer=args.sft_writer, teacher_model=args.teacher_model,
         teacher_api_key_file=args.teacher_api_key_file,
+        router_mode="trained",
     )
     result = run_router_chain(router_model, GROUP, task_ids, trajectories, builder_config, greedy=True)
     route_counts = Counter(d["route"] for d in result.decisions)
@@ -438,7 +465,26 @@ def main() -> None:
 
     router_model = RouterPolicy()
     start_iteration = latest_checkpoint_iteration() + 1
-    if start_iteration > 1:
+
+    # Crash recovery: a resume_state.json for the iteration we're ABOUT to
+    # start means the last run died mid-iteration (router_iter{N}.pt for that
+    # N was never written, or we wouldn't be starting it again). Load the
+    # in-progress weights and pick up from the next un-run batch instead of
+    # redoing the whole iteration. A resume_state left over from an OLDER,
+    # since-completed iteration is stale and ignored.
+    resume_state = load_resume_state()
+    resume_batch_idx, resume_canonical_bank, resume_position = 0, [], 0
+    if resume_state is not None and resume_state.get("iteration") == start_iteration:
+        load_checkpoint(router_model, CHECKPOINT_DIR / "router_iterlatest.pt")
+        resume_batch_idx = resume_state["next_batch_idx"]
+        resume_canonical_bank = resume_state["canonical_bank"]
+        resume_position = resume_state["position"]
+        print(
+            f"resumed mid-iteration {start_iteration} from batch {resume_batch_idx} "
+            "(crash recovery -- optimizer moment estimates restart fresh, weights don't)",
+            flush=True,
+        )
+    elif start_iteration > 1:
         ckpt = CHECKPOINT_DIR / f"router_iter{start_iteration - 1}.pt"
         load_checkpoint(router_model, ckpt)
         print(f"resumed from {ckpt}", flush=True)
@@ -447,19 +493,27 @@ def main() -> None:
     for offset in range(args.iterations):
         iteration = start_iteration + offset
         batches = split_batches(task_ids, args.batch_size)
-        canonical_bank: list[dict[str, Any]] = []
-        position = 0
+        if iteration == start_iteration and resume_batch_idx > 0:
+            canonical_bank, position, start_batch = resume_canonical_bank, resume_position, resume_batch_idx
+        else:
+            canonical_bank, position, start_batch = [], 0, 0
 
         for batch_idx, batch_task_ids in enumerate(batches):
+            if batch_idx < start_batch:
+                continue
             canonical_bank = run_one_batch_update(
                 router_model, optimizer, iteration, batch_idx, batch_task_ids, trajectories,
                 canonical_bank, position, len(task_ids), args,
             )
             position += len(batch_task_ids)
+            save_checkpoint(router_model, "latest", CHECKPOINT_DIR)
+            save_resume_state(iteration, batch_idx + 1, canonical_bank, position)
 
         checkpoint_path = save_checkpoint(router_model, iteration, CHECKPOINT_DIR)
         validation = run_validation_pass(router_model, iteration, task_ids, trajectories, probe_task_ids, args)
         print(f"=== iteration {iteration} done === checkpoint={checkpoint_path} validation={validation}", flush=True)
+        if RESUME_STATE_PATH.exists():
+            RESUME_STATE_PATH.unlink()  # iteration is now fully checkpointed via router_iter{N}.pt
 
 
 if __name__ == "__main__":
