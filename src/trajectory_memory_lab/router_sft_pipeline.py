@@ -27,6 +27,42 @@ ROOT = Path(__file__).resolve().parents[2]
 APPWORLD_PYTHON = "/nas04/yixuh/appworld_venv/bin/python"
 APPWORLD_ROOT_DEFAULT = "/nas04/yixuh/appworld_root"
 
+# Per-domain replay config -- what interpreter, script, and agent system
+# prompt turn a committed sft/both decision into a live replayed trajectory.
+# AppWorld stays the literal defaults on every existing call so
+# train_router_selfreward.py's calls are unaffected; ALFWorld is here so
+# scripts/run_alfworld_router_llm_probe.py (and any future ALFWorld GRPO
+# trainer) can reuse this same replay/verify machinery instead of
+# duplicating it -- everything in this module except this dict and the
+# literal AppWorld defaults below is already domain-agnostic (it only reads
+# generic trajectory/record shapes).
+_REPLAY_CONFIG = {
+    "appworld": {
+        "python": APPWORLD_PYTHON,
+        "script": "scripts/run_appworld_guided_replay.py",
+        "agent_system": AGENT_SYSTEM,
+        "env_var": "APPWORLD_ROOT",
+        "env_default": APPWORLD_ROOT_DEFAULT,
+        "extra_args": [],
+    },
+    "alfworld": {
+        "python": "/nas04/yixuh/alfworld_venv310/bin/python",
+        "script": "scripts/run_alfworld_guided_replay.py",
+        "agent_system": None,  # resolved lazily below to avoid importing alfworld_agent under the main .venv
+        "env_var": "ALFWORLD_DATA",
+        "env_default": "/nas04/yixuh/alfworld_data",
+        "extra_args": ["--split", "train"],
+    },
+}
+
+
+def _agent_system_for(domain: str) -> str:
+    if domain == "alfworld":
+        from .alfworld_agent import AGENT_SYSTEM as ALFWORLD_AGENT_SYSTEM
+
+        return ALFWORLD_AGENT_SYSTEM
+    return AGENT_SYSTEM
+
 TRAIN_TRIGGER_SIZE = 8  # accumulate this many newly VERIFIED examples, then retrain once
 
 
@@ -55,20 +91,32 @@ def sft_candidates_from_records(records: list[dict[str, Any]]) -> list[dict[str,
 
 def replay_and_verify(
     candidate: dict[str, Any], output_dir: Path, model: str, base_url: str, seed: int,
+    *, domain: str = "appworld",
 ) -> dict[str, Any] | None:
-    """One guided replay; returns a training-ready example iff AppWorld
-    itself scores the fresh live attempt success=True."""
+    """One guided replay; returns a training-ready example iff the
+    environment itself scores the fresh live attempt success=True.
+
+    `domain` selects the interpreter/script/env var/agent prompt via
+    `_REPLAY_CONFIG` -- AppWorld's script takes a bare task_id and resolves
+    it against its own installed task DB regardless of split, while
+    ALFWorld's needs an explicit `--split` since task_ids only disambiguate
+    within one split directory (hence "train" being baked into
+    `_REPLAY_CONFIG["alfworld"]["extra_args"]`: guided replay only ever
+    targets committed decisions from a train-split rollout)."""
+    cfg = _REPLAY_CONFIG[domain]
     task_id = candidate["task_id"]
-    out_path = output_dir / f"{task_id}.json"
+    out_path = output_dir / f"{task_id.replace('/', '__')}.json"
     env = dict(os.environ)
-    env["APPWORLD_ROOT"] = env.get("APPWORLD_ROOT", APPWORLD_ROOT_DEFAULT)
+    env[cfg["env_var"]] = env.get(cfg["env_var"], cfg["env_default"])
     env["PYTHONPATH"] = str(ROOT / "src")
     cmd = [
-        APPWORLD_PYTHON, "-u", str(ROOT / "scripts/run_appworld_guided_replay.py"),
+        cfg["python"], "-u", str(ROOT / cfg["script"]),
         "--task-id", task_id, "--guidance", candidate["plan"], "--output", str(out_path),
-        "--experiment-name", f"router_sft_replay_{task_id}", "--model", model, "--base-url", base_url,
-        "--seed", str(seed),
+        *cfg["extra_args"],
+        "--model", model, "--base-url", base_url, "--seed", str(seed),
     ]
+    if domain == "appworld":
+        cmd.extend(["--experiment-name", f"router_sft_replay_{task_id}"])
     if candidate.get("previous_success"):
         cmd.append("--previous-success")
     result = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=1200)
@@ -78,19 +126,23 @@ def replay_and_verify(
     trajectory = record.get("trajectory") or {}
     if not trajectory.get("success"):
         return None
-    return {"task_id": task_id, "messages": training_messages(AGENT_SYSTEM, trajectory["steps"])}
+    return {
+        "task_id": task_id,
+        "messages": training_messages(_agent_system_for(domain), trajectory["steps"]),
+    }
 
 
 def collect_batch_sft_examples(
     chosen_records: list[dict[str, Any]], output_dir: Path, model: str, base_url: str, seed: int,
+    *, domain: str = "appworld",
 ) -> list[dict[str, Any]]:
     """Replays every committed sft/both decision from the batch's CHOSEN
     candidate (not all K -- replaying every candidate's sft picks would
-    multiply AppWorld-eval cost by K for no reward benefit, since only the
-    chosen candidate's bank continues into the next batch)."""
+    multiply eval cost by K for no reward benefit, since only the chosen
+    candidate's bank continues into the next batch)."""
     examples = []
     for candidate in sft_candidates_from_records(chosen_records):
-        example = replay_and_verify(candidate, output_dir, model, base_url, seed)
+        example = replay_and_verify(candidate, output_dir, model, base_url, seed, domain=domain)
         if example is not None:
             examples.append(example)
     return examples

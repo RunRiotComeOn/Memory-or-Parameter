@@ -133,6 +133,7 @@ def generate_plan_with_teacher(
     api_key_file: Path = DEFAULT_TEACHER_API_KEY_FILE,
     temperature: float = 0.1,
     max_retries: int = 6,
+    system_prompt: str = GEMINI_TEACHER_SYSTEM,
 ) -> dict[str, Any] | None:
     """External-teacher counterpart of a local `client.json_chat(system=
     APPWORLD_SFT_WRITER_SYSTEM, ...)` call -- same input (`build_writer_payload`),
@@ -148,6 +149,13 @@ def generate_plan_with_teacher(
     an earlier guess (`gemini-3-pro-preview`) had already been retired, with
     the API's own 404 naming this one as the replacement. Verify with
     `client.models.list()` if this starts 404ing again.
+
+    `system_prompt` defaults to the AppWorld framing (`GEMINI_TEACHER_SYSTEM`,
+    which names concrete `apis.<app>.<api>` calls) so every existing caller is
+    unaffected; `alfworld_sft_writer.generate_plan_with_teacher` calls this
+    with an ALFWorld-specific prompt instead of duplicating the Gemini-client
+    plumbing, since everything below the prompt (payload shape, schema,
+    retry/backoff, validation) is already domain-agnostic.
     """
     try:
         from google import genai
@@ -168,7 +176,7 @@ def generate_plan_with_teacher(
                 model=model,
                 contents=json.dumps(payload, ensure_ascii=False),
                 config=types.GenerateContentConfig(
-                    system_instruction=GEMINI_TEACHER_SYSTEM,
+                    system_instruction=system_prompt,
                     temperature=temperature,
                     response_mime_type="application/json",
                     response_json_schema=GEMINI_RESPONSE_SCHEMA,

@@ -228,12 +228,23 @@ _ROUTED_REQUIREMENTS = {
 }
 
 
-def routed_writer_system(route: str) -> str:
-    """Content-only writer prompt: `route` is given, not chosen by the model."""
+def routed_writer_system(
+    route: str, domain_description: str = "a customer-service agent"
+) -> str:
+    """Content-only writer prompt: `route` is given, not chosen by the model.
+
+    `domain_description` fills the one sentence that names what kind of agent
+    produced the trajectory -- everything else below (evidence rules, memory
+    operations, JSON schema) is already domain-agnostic, since it only reacts
+    to the generic trajectory/bank shapes both AppWorld and ALFWorld share.
+    Defaults to the original AppWorld/tau-bench framing so every existing
+    caller is unaffected; `router_bank_builder.run_router_chain` passes an
+    ALFWorld-appropriate description when `config.domain == "alfworld"`.
+    """
     if route not in _ROUTED_REQUIREMENTS:
         raise KeyError(f"routed_writer_system is only for memory/sft/both, got: {route}")
     requirements = _ROUTED_REQUIREMENTS[route]
-    return f"""You are the writer for a customer-service agent's learning loop.
+    return f"""You are the writer for {domain_description}'s learning loop.
 
 You receive one completed task trajectory and the active external memory bank for its domain. The
 routing decision has ALREADY been made by an upstream policy: this trajectory has been assigned

@@ -182,6 +182,34 @@ class RouterBuilderConfig:
     sft_writer: str = "teacher"
     teacher_model: str = "gemini-3.1-pro-preview"
     teacher_api_key_file: Path = Path("/nas04/yixuh/.config/continual-memory/gemini_api_key")
+    # System default (2026-09-18): route comes from a prompted small LLM
+    # (router_llm_policy.decide_route), not the trained linear RouterPolicy.
+    # "trained" keeps the exact pre-existing GRPO path -- train_router_
+    # selfreward.py passes this explicitly so its behavior is unaffected by
+    # this default changing. See router_llm_policy.py's module docstring.
+    # "trained_llm" (router_llm_trainable.TrainableLLMRouter) is the
+    # GRPO-trainable version of "llm": the same prompt and payload, but the
+    # route comes from a differentiable 4-way categorical over LoRA-adapted
+    # logits instead of an untrained temperature-0 API call. `router_model`
+    # is then a TrainableLLMRouter rather than a RouterPolicy, and there is
+    # no server involved -- see router_llm_trainable.py's module docstring.
+    router_mode: str = "llm"
+    # Which benchmark produced `trajectories` -- "appworld" (default) or
+    # "alfworld". Changes two things: the one-sentence framing passed to
+    # `routed_writer_system` (a coding agent vs. a household-task agent), and
+    # which sft writer module (`appworld_sft_writer` / `alfworld_sft_writer`)
+    # supplies the self/teacher system prompts and `generate_plan_with_teacher`
+    # -- AppWorld's are written specifically for a code-execution transcript
+    # ("apis.spotify.login", "code turns"); sending them an ALFWorld
+    # transcript of room navigation and admissible commands would produce a
+    # plan hallucinating APIs that do not exist, actively worse than no plan,
+    # which is why `alfworld_sft_writer.py` exists as a parallel module
+    # instead of just reusing AppWorld's prompts. Guided replay
+    # (turning a committed sft/both decision into verified SFT training data)
+    # is a separate step, done by `run_alfworld_guided_replay.py` /
+    # `run_appworld_guided_replay.py` outside this function -- this function
+    # only drafts and records the decision.
+    domain: str = "appworld"
 
 
 @dataclass
@@ -202,7 +230,7 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def run_router_chain(
-    router_model: RouterPolicy,
+    router_model: RouterPolicy | None,
     group: str,
     task_ids: list[str],
     trajectories: dict[str, dict[str, Any]],
@@ -270,10 +298,15 @@ def run_router_chain(
             enable_thinking=False,
             timeout=config.timeout,
         )
+        writer_domain_description = (
+            "a household-task agent operating in a text-adventure environment"
+            if config.domain == "alfworld"
+            else "a customer-service agent"
+        )
         draft_reply = None
         try:
             draft_reply = client.json_chat(
-                system=routed_writer_system("memory"),
+                system=routed_writer_system("memory", writer_domain_description),
                 user=json.dumps(draft_payload, ensure_ascii=False, separators=(",", ":")),
             )
             draft_decision = normalize_alloc_decision(draft_reply.parsed)
@@ -310,6 +343,10 @@ def run_router_chain(
         # not one a caller-side guard should make for it; the writer is handed
         # `success` and the evaluator verdict (`build_writer_payload`) and
         # writes the appropriate kind of plan.
+        sft_writer_module = "alfworld_sft_writer" if config.domain == "alfworld" else "appworld_sft_writer"
+        self_writer_system_name = (
+            "ALFWORLD_SFT_WRITER_SYSTEM" if config.domain == "alfworld" else "APPWORLD_SFT_WRITER_SYSTEM"
+        )
         draft_sft_plan: dict[str, Any] | None = None
         if config.sft_writer == "teacher":
             # External model (default: Gemini) writes the plan; the base
@@ -317,29 +354,35 @@ def run_router_chain(
             # appworld_sft_writer.py's module docstring for why this is the
             # default (probe_sft_repair_yield_gemini_teacher.py: 62.5% rescue
             # yield on genuinely-still-failing tasks, running_log.md section
-            # 11). Any failure here (network, bad key, retries exhausted)
-            # returns None exactly like the self-writer's except-clause below
-            # -- not fatal to this task's decision, just no sft plan for it.
-            from .appworld_sft_writer import generate_plan_with_teacher
+            # 11 -- ALFWorld has no equivalent probe yet, see
+            # alfworld_sft_writer.py's module docstring for the bet being
+            # made by defaulting to teacher here too). Any failure here
+            # (network, bad key, retries exhausted) returns None exactly like
+            # the self-writer's except-clause below -- not fatal to this
+            # task's decision, just no sft plan for it.
+            import importlib
+
+            generate_plan_with_teacher = importlib.import_module(
+                f".{sft_writer_module}", __package__
+            ).generate_plan_with_teacher
 
             writer_output = generate_plan_with_teacher(
                 trajectory, model=config.teacher_model, api_key_file=config.teacher_api_key_file,
             )
         else:
             try:
-                from .appworld_sft_writer import (
-                    APPWORLD_SFT_WRITER_SYSTEM,
-                    build_writer_payload,
-                    validate_writer_output,
-                )
+                import importlib
+
+                writer_mod = importlib.import_module(f".{sft_writer_module}", __package__)
+                self_writer_system = getattr(writer_mod, self_writer_system_name)
 
                 sft_reply = client.json_chat(
-                    system=APPWORLD_SFT_WRITER_SYSTEM,
+                    system=self_writer_system,
                     user=json.dumps(
-                        build_writer_payload(trajectory), ensure_ascii=False, separators=(",", ":")
+                        writer_mod.build_writer_payload(trajectory), ensure_ascii=False, separators=(",", ":")
                     ),
                 )
-                writer_output = validate_writer_output(sft_reply.parsed)
+                writer_output = writer_mod.validate_writer_output(sft_reply.parsed)
             except Exception:
                 writer_output = None
         if writer_output is not None:
@@ -368,21 +411,61 @@ def run_router_chain(
             draft_text = _draft_content_text(draft_memory, draft_sft_plan)
             recent_changes_text = _recent_changes_text(bank, position, recent_window_tasks)
 
-        features = features_of(trajectory, bank, recent_changes_text, draft_text)
-        if greedy:
-            route, logprob = greedy_action(router_model, features), torch.zeros(())
-            # No gradient here, but the distribution is still worth recording:
-            # it is how we see whether the *policy* has collapsed at validation
-            # time, which argmax alone cannot show.
-            with torch.no_grad():
-                dist = action_distribution(router_model, features)
-                entropy, probs = dist.entropy(), dist.probs
+        llm_rationale: str | None = None
+        sampled_decision = None
+        if config.router_mode == "trained_llm":
+            # GRPO-trainable LLM router. Unlike the "llm" mode below this has
+            # a real, differentiable logprob -- but the graph is NOT retained
+            # here: 80 live forward graphs of an 8B model per batch does not
+            # fit, so what is recorded is the prompt token ids plus the chosen
+            # index, and the training loop replays them with grad at update
+            # time. The weights do not change in between, so the replayed
+            # logprob is the sampled one exactly (asserted by
+            # router_llm_trainable.verify_recompute_matches_sample).
+            from .router_llm_trainable import SampledDecision
+
+            prompt_ids = router_model.build_prompt_ids(
+                trajectory, len(active_entries(bank)), recent_changes_text, draft_memory, draft_sft_plan,
+            )
+            pick = router_model.greedy_action if greedy else router_model.sample_action
+            route, route_index, probs, entropy = pick(prompt_ids)
+            logprob = torch.zeros(())  # placeholder; the real one is recomputed at update time
+            sampled_decision = SampledDecision(
+                prompt_ids=prompt_ids, index=route_index, route=route,
+                task_id=task_id, group=group, probs=probs, entropy=entropy,
+            )
+        elif config.router_mode == "llm":
+            # System default: a prompted small model decides, reading the
+            # SAME drafted content as the router features below would
+            # otherwise only see hashed. No logprob/entropy/gradient here --
+            # this mode is not trained (see router_llm_policy.py). Zero
+            # tensors keep every downstream consumer that expects these keys
+            # (entropy logging, GRPO's pg_term sum) working unchanged; a
+            # zero-entropy, zero-logprob decision simply contributes nothing
+            # if a caller mistakenly tries to train through this mode.
+            from .router_llm_policy import decide_route
+
+            route, llm_rationale = decide_route(
+                trajectory, len(active_entries(bank)), recent_changes_text, draft_memory, draft_sft_plan,
+                model=config.model, base_url=config.base_url, seed=config.seed + position,
+            )
+            logprob, entropy, probs = torch.zeros(()), torch.zeros(()), None
         else:
-            route, logprob, dist = sample_action(router_model, features)
-            entropy, probs = dist.entropy(), dist.probs
+            features = features_of(trajectory, bank, recent_changes_text, draft_text)
+            if greedy:
+                route, logprob = greedy_action(router_model, features), torch.zeros(())
+                # No gradient here, but the distribution is still worth recording:
+                # it is how we see whether the *policy* has collapsed at validation
+                # time, which argmax alone cannot show.
+                with torch.no_grad():
+                    dist = action_distribution(router_model, features)
+                    entropy, probs = dist.entropy(), dist.probs
+            else:
+                route, logprob, dist = sample_action(router_model, features)
+                entropy, probs = dist.entropy(), dist.probs
         live_decisions.append({
             "logprob": logprob, "route": route, "task_id": task_id, "group": group,
-            "entropy": entropy, "probs": probs,
+            "entropy": entropy, "probs": probs, "sampled_decision": sampled_decision,
         })
 
         record: dict[str, Any]
@@ -391,7 +474,7 @@ def run_router_chain(
             decision = {
                 "route": "neither",
                 "gap_type": draft_decision.get("gap_type"),
-                "route_rationale": "router",
+                "route_rationale": llm_rationale if llm_rationale is not None else "router",
                 "memory_operation": None,
                 "target_memory_id": None,
                 "memory": None,
@@ -425,7 +508,7 @@ def run_router_chain(
             decision = {
                 "route": route,
                 "gap_type": draft_decision.get("gap_type"),
-                "route_rationale": draft_decision.get("route_rationale"),
+                "route_rationale": llm_rationale if llm_rationale is not None else draft_decision.get("route_rationale"),
                 "memory_operation": draft_operation if writes_memory(route) else None,
                 "target_memory_id": (
                     draft_decision.get("target_memory_id")
@@ -450,6 +533,14 @@ def run_router_chain(
 
             validation = validate_alloc_decision(decision, trajectory, active_entries(bank))
             record["hard_validation"] = validation
+            # Whether the router HAD an sft plan to choose, independent of
+            # whether it chose one. `sft_status` below cannot answer this --
+            # it is derived from the route that was taken -- and the missing
+            # distinction is exactly what made DESIGN.md section 16.3's first
+            # exploration measurement read as policy collapse: p(sft)=p(both)=0
+            # is correct judgment when there is no plan to commit, and a bug
+            # only when there is one.
+            record["drafted_sft_plan_available"] = draft_sft_plan is not None
             if not validation["memory"]["required"]:
                 record["status"] = "no_write"
             elif validation["memory"]["accepted"]:
