@@ -174,3 +174,297 @@ gemini      救回 8/15 = 53%
 ---
 
 *后续每次新跑动，在此文件末尾追加一节，格式同上：reward 定义、关键参数、产物目录、结果。*
+
+## 13. `train_router_llm_grpo.py`（router 换成 LoRA 可训练的 LLM，本机 COE-CS-sv002）
+
+- **改动**：router 从 144 参数线性分类器（`router_policy.RouterPolicy`）换成 **Qwen3.5-35B-A3B + LoRA**
+  （`src/trajectory_memory_lab/router_llm_trainable.py`）。reward 定义、batch 切分、GRPO advantage、
+  "随机选一个候选延续 bank"这些**全部沿用 §9 的 `train_router_selfreward.py`，一行没改**——换的只是
+  "谁做决定"和"梯度打在哪"。`train_router_selfreward.py` 本身没有被修改，两个脚本是并列实验。
+  详细设计见 DESIGN.md §16。
+- **reward**：与 §9 完全相同。`advantage_k = self_pass_rate_k − mean_j(self_pass_rate_j)`，
+  用本 batch 自己的 10 道题 replay 打分；`self_baseline` 只记日志、不进梯度（§14.1 的结论沿用，
+  没有重新引入 K+1 均值）。
+- **动作参数化（这是本节的核心）**：不是自由生成。强制 assistant 轮以 `{"route": "` 开头，四个 route
+  的**首 token 两两不同**（memory=17269 / s=82 / both=21028 / ne=811，构造时对真实 tokenizer 断言），
+  所以一次前向在这一个位置上对 4 个 logit 做 `log_softmax` 就是完整策略——可微、熵精确，和线性 router
+  的 `Categorical` 是同一个东西。
+  **因此没有用 vLLM，也没有用 LoRA 热加载**：两者在本仓库 vLLM 0.17.1 上都确实可用（已查证
+  `POST /v1/load_lora_adapter` + `load_inplace`，以及 chat-completions 的 `logprobs`），但 router 每个
+  决策只要 ~0.2s，一个 batch 80 个决策 ≈ 1-2 分钟，对比同 batch 的 AppWorld self-eval ~5.8 小时，
+  推理引擎没有可优化的东西。采样和梯度共用同一份权重，所以重算的 logprob **就是**采样时那个值
+  （实测 `|diff| = 0.00e+00`），也没有任何东西需要在 `optimizer.step()` 之后同步。
+- **关键参数**：Qwen3.5-35B-A3B（LoRA r=8, alpha=32, all-linear, **11,238,720** 个可训练参数——比
+  8B 的 21.8M 少，因为 hidden_size 只有 2048，而 256 个专家是融合的 3D `nn.Parameter`
+  （`mlp.experts.gate_up_proj`）不是 `nn.Linear`，`all-linear` 够不到它们；LoRA 落在
+  linear_attn / self_attn 投影、shared_expert 和 MoE 门控上），
+  **lr=1e-5**（不是 §9 的 0.01，也不是本仓库 SFT 的 1e-4——实测 1e-4 一步就把某个 route 概率从
+  0.00000 推到 0.949 且熵正则发散，见 DESIGN.md §16.4），`--max-grad-norm 1.0`，
+  `entropy_coef=0.01`（沿用 v4 标定），`policy_temperature=1.0`，K=8，batch_size=10。
+- **GPU / 端口 / 隔离（本机与另一台机器共享 NFS，全部避开）**：
+  - 两个确定性 TP=2 副本：**8030（GPU 0,1）/ 8031（GPU 4,5）**，tmux `routerllm_server_a` /
+    `routerllm_server_b`，日志 `router_reward_v1/router_llm_grpo_v1_server_{a,b}.log`。
+  - router 训练副本在 **GPU 6,7**（Qwen3.5-35B-A3B，`device_map="auto"`，权重 32.3GiB/卡）。
+    6 张空闲卡全部用上，没有余量。
+  - **不在本仓库 `.venv` 里跑**：`.venv` 装的是 vLLM 0.17.1，它钉 transformers 4.57.3，而 4.57.3
+    不认识 `qwen3_5_moe`（`AutoConfig` 直接拒绝这个 checkpoint）。router 走单独的
+    **`/nas04/yixuh/router_venv`**（transformers 5.17.0 + peft 0.21.0 + torch 2.10.0+cu128），
+    两个 serving 副本的环境一点没动。`AutoModelForCausalLM` 映射到 `Qwen3_5MoeForCausalLM`，
+    只建语言塔（等价于 server 的 `--language-model-only`），71.9GB checkpoint 里加载约 64.6GB。
+  - **GPU 2、3 和端口 8001/8002 是别人的**（用户 `haskari` 的 `judge_server.py`，已跑 18 天），没有动。
+  - **`APPWORLD_ROOT=/nas04/yixuh/appworld_root_llmgrpo`**（`data/` 拷了一份 194M，
+    `experiments/outputs` 全新空目录），按 §10 的教训隔离，不与 v5 / v5_nofeat 抢同一批 task 目录。
+- **产物目录**：`router_reward_v1/router_llm_grpo_v1/`（冒烟批次写在
+  `router_reward_v1/router_llm_grpo_v1_probe1/`，不污染正式目录）。
+- **开工前的测量（DESIGN.md §16.3，记在这里因为它差点得出相反结论）**：GRPO 要求 K 个候选真的会做出
+  不同决策，否则 advantage 全 0、梯度全 0，而日志看起来完全正常。第一次用 `cheap_train_v5` 的真实
+  record 量，测出 8B 平均熵只有 0.037 nats、`sft`/`both` 概率≈0，像是彻底坍缩——**但那 20 条 record
+  里 0 条同时带 memory 和 sft 草稿**，`sft`/`both` 本来就没东西可提交，给 0 概率是正确判断。补上真实
+  Gemini 修复计划让四个 route 都可选之后重测：8B 在 T=1.0 下平均熵 0.154、p(argmax)=0.931、
+  **P(8 个候选完全相同)=0.003**，探索足够。顺带一条反直觉结论：**模型越大越确定、探索越少**
+  （8B 的熵只有 1.7B 的一半）。
+- **冒烟测试**（三个，全部在真实训练启动前跑过并通过，见 DESIGN.md §16.5）：
+  `smoke_router_llm_logprob.py`、`smoke_router_llm_policy_gradient.py`、
+  `smoke_router_llm_batch_e2e.py`。
+- **⚠️ `--enable-sft-lora` 默认关闭，开之前必须先导出服务端变量**：`scripts/router_sft_lora_update.sh`
+  的默认值是 `det_server_a`/`det_server_b` + 端口 8000/8001 + GPU 0,1/2,3——**跟本机的实际配置全不一样**
+  （本机是 `routerllm_server_a`/`routerllm_server_b` + 8030/8031 + GPU 0,1/4,5），而且 GPU 2,3 是
+  `haskari` 的。照默认值跑会去 kill 不存在的 session（脚本会 abort，这是好的），但如果 session 名碰巧
+  对上了就会拿别人的卡去训练。要开这条路必须先
+  `export SERVER_A_NAME=routerllm_server_a SERVER_B_NAME=routerllm_server_b SERVER_A_PORT=8030
+  SERVER_B_PORT=8031 SERVER_A_GPUS=0,1 SERVER_B_GPUS=4,5`。这就是 §10 那条教训的复现，所以这一版把
+  LoRA 重训做成了显式开关而不是默认行为——第一次跑不应该有能力把两个副本弄下线。
+  guided replay 本身照常跑（只有"攒够 8 条就重训"这一步被 gate 住），所以 sft 这条路的产出率照样能观测。
+- **预算（`--rollouts-per-batch 8 --batch-size 10` 的实测估计）**：~56.6h/iteration =
+  8.0h 起草（720 次 × ~40s，实测值，串行只用一个副本）+ 42.0h self-eval（4 轮 × 9 batch × 70min）
+  + 2.1h sft guided-replay（未验证）+ 4.5h validation。
+  **注意：§9 给 v5 报的 49.6h 漏算了起草时间**——`run_router_chain` 是每个候选都要把这 10 道题全部起草
+  一遍（§14.3 的 content-before-route），也就是每个 batch `K × batch_size = 80` 次起草而不是 10 次，
+  而且它串行占用一个副本、不与评测重叠。v5 的真实耗时应该也要在它的估计上加 ~8h。
+- **换成 MoE 之后必须补的三件事（都不是可选项，全部实测过）**：
+  1. **梯度检查点是"能不能跑"而不是"快不快"**：35B 权重占 32.3GiB/卡，47.4GiB 可用里只剩 15GiB 给
+     激活。不开检查点时 **1,024 token 的反向峰值就有 40.6GiB**（单个决策 8.3GiB 激活），4,096 token
+     直接 OOM——而 router 提示中位数是 11.5k。开了之后 1,024 降到 33.0GiB，16,384 能过（42.8GiB），
+     24,576 仍 OOM。代价是更新变慢：8k 时 19.2s、16k 时 64.4s。
+     **坑**：transformers 只在 `if self.gradient_checkpointing and self.training` 时走检查点分支，
+     而 router 是刻意 `eval()` 的，所以第一次开完 `is_gradient_checkpointing=True` 但峰值一点没变。
+     现在带梯度的重算包在 `train()` 里（`TrainableLLMRouter._checkpointing`）。**这不改策略**：
+     该模型 `attention_dropout=0.0`、`lora_dropout=0.0`，两种模式下四个 route logit
+     **逐位相同（max |diff| = 0.0）**，实测过而不是假设——这正是
+     `verify_recompute_matches_sample` 仍然能断言 `|diff| = 0.00e+00` 的前提。
+  2. **router payload 必须截断**（这条与 MoE 无关，8B 也会撞）：今天 11:34 改过
+     `router_llm_policy.build_router_payload`，把**完整**对话记录放进了 payload，而 `probe1`（10:33）
+     跑的是改动之前的版本。结果 90 条训练轨迹里 **66 条**光 payload 就超过原来的
+     `max_prompt_tokens=8192`（中位数 11,536，最长 30,713）。**砍草稿没用**：起草的 memory 候选中位数
+     只有 184 token、sft 计划 285 token，两者合计约占提示的 3%，而且正是 §14.3 让 router 判断的东西。
+     所以只截断对话记录：`ROUTER_MAX_STEP_CHARS=31_000`，保留头尾完整的 step、**尾部优先**（AppWorld
+     的失败出现在结尾，开头多是任务铺垫），中间插一条显式的省略标记，并在 payload 里加
+     `trajectory_steps_elided` 计数——让 router 能区分"agent 这段什么都没做"和"这段被截掉了"。
+     按字符而不是 token 计预算，是因为这个函数同时服务于没有 tokenizer 的 `decide_route`，而
+     `router_llm_trainable` 的"未训练探针即 step-0 基线"论证依赖两边看到逐字节相同的文本；
+     2.646 chars/token 是 90 条里最低的比值，所以字符预算换算出的 token 上界对每一条都成立。
+     截断后实测（配最坏情况草稿）：**90/90 全部落在 16,384 守卫之下**，最长 12,768、中位数 10,261，
+     55/90 的轨迹被省略了中段。
+  3. **新 venv 少装 `google-genai`，把 `sft`/`both` 两条路整个弄死了，而日志完全正常**：
+     `appworld_sft_writer.generate_plan_with_teacher` 的第一个失败分支就是
+     `from google import genai` 的 `ImportError -> return None`，而它按设计对**任何**失败都静默返回
+     `None`（"Gemini 短暂不可达不该让整个决策失败"）。`router_venv` 是为了绕开 transformers 版本冲突
+     新建的，只装了 torch/transformers/peft/openai，于是 20 条 record **全部**拿不到修复计划。
+     这正是 §16.3 那个陷阱的原样复现：没有计划可提交时，`sft`/`both` 概率低是**正确判断**，
+     照着读会得出"策略没塌"的结论，而实际上 4 分类动作空间已经塌成 2 分类。
+     **能发现它，是因为这次在 record 里加了 `drafted_sft_plan_available` 这个直接诊断位**
+     （`router_bank_builder`）——原有的 `sft_status` 是从**选中的 route** 反推的，回答不了
+     "当时到底有没有计划可选"。装上 `google-genai==1.56.0` 后实测 3/3 出计划，探索度表已重测。
+  4. **三个冒烟测试在 35B 上全部重跑并通过**，`|diff| = 0.00e+00` 在检查点路径下依然成立，
+     梯度只进 LoRA（350/700 个适配器张量拿到非零梯度）、基座零梯度。lr 扫描重测的结论与 §16.4 同向，
+     `lr=1e-5` 不用改：一步 +1.52e-02、9 步到 p=0.683（8B 当时 9 步到 ~0.87），5e-5 起一步就饱和到 1.0。
+- **探索度重测（35B，n=20 真实 record，13/20 带真实 Gemini 计划，`scripts/probe_router_llm_entropy.py`）**：
+
+  | 模型 | T | 平均熵 (nats) | p(argmax) | P(8 候选单决策全同) | 平均 route 概率 | argmax 分布 |
+  |---|---|---|---|---|---|---|
+  | Qwen3-8B（§16.3 原表） | 1.0 | 0.154 | 0.931 | 0.0033 | mem .177 / sft .000 / both .136 / neither .686 | neither 13, memory 4, both 3 |
+  | **Qwen3.5-35B-A3B** | **1.0** | **1.171** | **0.473** | **0.0119** | mem .268 / **sft .263** / both .136 / neither .333 | memory 8, neither 8, sft 3, both 1 |
+
+  **§16.3 那条"模型越大越确定、探索越少"的反直觉结论，在这里被推翻了**：35B MoE 的熵是 8B 的 7.6 倍，
+  已经接近均匀（ln4=1.386），整个 batch 全同的概率 ~0。温度不用动，`policy_temperature=1.0` 保持。
+  更重要的是，§16.3 留的那个**已知缺口关上了**——8B 在 T=1.0 下几乎不单独选 `sft`（p≈0.000），
+  纯 `sft` 这个动作是半死的；35B 给到 p(sft)=0.263，argmax 里也真的选了 3 次，四个 route 都活着。
+  （这张表的第一版测出 p(sft)=0.047 且 `drafted_sft_plan_available` 为 0/20，就是上面第 3 条那个
+  缺依赖的坑，已作废重测。）
+- **实测速率**：起草 ~27s/任务（比预算假设的 40s 快）；router 自身前反向在 ~11k token 的中位提示上
+  约 2.7s 采样 + ~35s 反向，一个 batch 80 个决策约 50 分钟，约 1.2h→7.6h/iteration，
+  仍是 self-eval 42h 的小头，但不再是 8B 时那个"1-2 分钟/batch"可忽略量。
+- **状态**：2026-09-18 20:15 正式启动，tmux `train_router_llm_grpo`，日志
+  `router_reward_v1/train_router_llm_grpo.log`。预算 ~56.6h/iteration（不含 router 自身的 ~7.6h）。
+  冒烟批次（K=2、1 个 batch、真实 self-eval）此前已完成于 `probe1`，但跑的是 8B + 截断前的 payload，
+  不能直接当作本次配置的验证。
+
+## 14. `run_router_llm_probe.py`（LLM router 不训练，本机，已完成，与 §13 互补）
+
+- **目的**：§13 是真正 GRPO 训练 LLM router 的权重；这节是同一个 `router_llm_policy.py`（同一套 prompt、
+  同一个 payload 构造）在**完全不训练**的情况下，纯靠 `qwen35-tau`（跟 task agent 同一个 35B MoE，
+  temperature=0）自己的判断跑一遍，看 step-0 的路由分布和下游效果长什么样——这也是 §13 训练如果真的
+  有进展，将来用来对比的起点。
+- **模型**：没有用单独的小模型（最早试过 Qwen3-1.7B 单独起服务，用户否决，要求跟 task agent 同型号），
+  直接复用本机 `det_server_a/b`（`qwen35-tau`），不需要额外显存/端口。
+- **输入**：`router_llm_policy.build_router_payload` 现在包含任务的完整 instruction + 完整
+  trajectory_steps（不再只是 success/reward/termination_reason 的摘要），加上 active_memory_count、
+  最近两个 batch 的 bank 变动、已经起草好的 memory/sft 候选内容——细节和截断逻辑见 §13 的记录（两边共用
+  同一个 `build_router_payload`）。
+- **产物目录**：`router_reward_v1/router_llm_probe_v1/`，日志 `router_reward_v1/router_llm_probe.log`。
+- **结果（90/90 路由决策 + 真实 57 题 dev 评测）**：
+  ```
+  route_counts = {'both': 11, 'memory': 16, 'neither': 31, 'sft': 32}，active_entries=14
+  成功题 → routes: {'both':10, 'memory':15, 'neither':10, 'sft':22}
+  失败题 → routes: {'neither':21, 'sft':10, 'memory':1, 'both':1}
+  ```
+  **完全没有坍塌**——四个 route 都在用，且方向合理：失败题几乎不写 memory/both（1/33），
+  多数走 neither 或 sft；成功题里 sft（巩固计划）反而最常见。
+- **⚠️ 首次算出的 0.4737 一度误判**：dev 评测默认走 `run_appworld_rollout.py` 现在的 `max_tokens=4096`
+  默认值，而能直接比的 `baseline_recheck`(0.4912)/G=8(0.5789) 都是旧的 2048 配置下测的——§12.2(b) 已经
+  指出这条不可比。当场在同一个副本（127.0.0.1:8000）、同 seed、同 4096 配置补跑了一次无记忆基线：
+  ```
+  router_reward_v1/baseline_recheck_4096/summary.json: pass_rate = 0.4211（24/57）
+  ```
+  **真正可比的结果：LLM router 0.4737 vs 无记忆基线 0.4211，+5.26pp。**
+  一个完全没训练、只是能读到真实任务内容和完整轨迹的 35B router，判断力已经比不给任何记忆更好——
+  这是 §13 GRPO 训练如果有效，需要超过的起点。
+
+## 15. ALFWorld 兼容层（本机，第二个 benchmark，已跑通端到端）
+
+- **动机**：用户要求找一个"不那么偏应用"的第二个 benchmark 跑同一套流程（明确否决了 tau2-bench——
+  "感觉tau bench太偏向非常实际的应用了"）。选了 ALFWorld：TextWorld 文字冒险式的家务任务，
+  纯文本模式不需要 Docker/显示/GPU 渲染，跟 AppWorld（代码执行沙盒）在任务性质上足够不同。
+- **Python 版本坑**：`textworld==1.7.0` 的 `EvalSymbol.derive()` 用
+  `locals().update(context["variables"]); eval(self.expression)` 这种 CPython 反模式，在 3.11+ 的
+  局部变量优化下会报 `NameError`（3.13 上实测复现）。ALFWorld 官方本来就要求 3.9/3.10，不是环境配置错，
+  是库本身不兼容新 CPython。**解法**：单独建了 `/nas04/yixuh/alfworld_venv310`（Python 3.10，
+  `python3.10 -m venv --without-pip` + 手动 `get-pip.py` 引导，因为原生 venv 没 `ensurepip`、
+  `virtualenv --download` 会在 NFS 上卡死），装了 `alfworld==0.4.2`、`pyyaml`、`openai`，
+  再 `pip install -e . --no-deps` 把本仓库的 `trajectory_memory_lab` 包也装进这个 venv
+  （`playwright` 没装但这条路径用不到，忽略那条 pip 冲突警告）。
+- **数据**：`alfworld-download` 到 `/nas04/yixuh/alfworld_data`（2.3GB），
+  `json_2.1.1/{train,valid_seen,valid_unseen}` 三个目录，配置写在
+  `/nas04/yixuh/alfworld_data/base_config.yaml`。
+- **训练/测试分离（用户明确要求"记得训练集和测试集要分清楚"）**：`train`(3553题)→写记忆/SFT 草稿的
+  基础 rollout 池，等价于 `base_train_v2`；`valid_seen`(140题)="eval_in_distribution"，同房型、
+  未见过的具体任务组合，较弱的分布内检验；`valid_unseen`(134题)="eval_out_of_distribution"，
+  房间布局本身就没在 train 里出现过，是真正的强泛化测试，应作为主 eval 指标。
+  用 `list_available_tasks()` 直接对三个目录各自扫描一遍并集合求交验证：
+  **train/valid_seen/valid_unseen 两两 task_id 交集均为 0**——没有任何题目跨 split 出现。
+- **新文件**：
+  - `src/trajectory_memory_lab/alfworld_agent.py`：`AGENT_SYSTEM`（文字指令：每轮从
+    admissible_commands 里原样回复一条，不接受的话最多重试 2 次后判 `ungrounded_action` 终止）、
+    `extract_command()`（精确/宽松匹配 admissible 列表）、`list_available_tasks()`（复现
+    `AlfredTWEnv.collect_game_files` 的过滤逻辑：solvable、6 种已知 task_type、排除 movable/Sliced）、
+    `load_task_env()`（单任务单 env：先让 `AlfredTWEnv.__init__` 走完整个 split 的
+    `collect_game_files`，再把 `game_files` 收窄成一个再 `init_env`——没做进一步优化，
+    每次单任务 rollout 都要付几秒钟全 split 扫描的代价）、`run_task()`（驱动一整局，
+    产出跟 AppWorld 同形的 canonical trajectory：`{"source_task_id","domain":"alfworld",
+    "task":{"id","instruction"},"success","reward","termination_reason","evaluation","steps"}`，
+    role 映射比 AppWorld 少一种——没有单独的 tool role，环境反馈和初始房间描述都算 `user`）。
+  - `scripts/run_alfworld_rollout.py`：结构照抄 `run_appworld_rollout.py`（每题一个子进程、
+    `--split train/valid_seen/valid_unseen`、`--memory-bank`/`--memory-top-k` 复用
+    `memory_retrieval.retrieved_block`——这个函数本来就跟 benchmark 无关，直接可用）。
+    必须用 `alfworld_venv310` 的解释器跑，不是仓库默认 `.venv`。
+- **端到端冒烟测试（真实调用 det_server_a，qwen35-tau，temperature=0，1 题，`--split train`）**：
+  跑通，无崩溃，产出合法 trajectory（41 步，`termination_reason=max_steps`，未成功）。
+  读了完整 transcript：agent 找到了目标 desk 上的 alarmclock，但下一步试了
+  `examine alarmclock 1`（不在 admissible 里，桌上物体不能直接 examine），收到"不是合法命令"的提示后
+  没有改试 `take alarmclock 1 from desk 1`，反而反复回复 `look`，40 步内没能恢复——这是 agent 在
+  未给记忆时的真实探索能力问题（prompt/策略层面），不是 harness 的 bug，留待后续用记忆/SFT 改善，
+  这次的目的只是验证技术管线本身。
+- **尚未做**：没有跑过 base train rollout 全池（对齐 `base_train_v2` 那种"先批量收集基础轨迹"的规模），
+  没有把 router/memory/SFT 全流程接到 ALFWorld 上——目前只验证了环境层 + agent harness + rollout
+  runner 三者能跑通、split 分离正确。
+
+- **第一批真实无记忆 rollout（2026-09-19，本机，已完成，0 错误）**：
+  两个批次分别打到 det_server_a（8000）/det_server_b（8001），4-way client 并发（server 端
+  `--max-num-seqs 1` 强制串行，client 并发不提速，只是不添乱），跑完各自才发现两边 tmux 会话已自然退出：
+  - `alfworld_experiment/base_train_v1/`：train split 随机抽样 40 题，**pass_rate = 0.825**（33/40，
+    6 超步数上限、1 `ungrounded_action`）——这是未来喂给 router/memory/SFT 起草的基础轨迹池，
+    等价于 `base_train_v2`。
+  - `alfworld_experiment/baseline_valid_unseen_v1/`：valid_unseen split（真正的分布外测试集，
+    房间布局在 train 里完全没出现过）随机抽样 57 题，**pass_rate = 0.7544**（43/57，13 超步数、
+    1 `ungrounded_action`）——**这是要拿来跟未来记忆/SFT/router 方案对比的无记忆基线数字**，
+    跟 AppWorld 那边"先测 baseline 再看增量"的方法论一致；后续任何"记忆有没有用"的结论，都必须是
+    同一批 57 题、同一份 `base_config.yaml`、同一个 replica 上测出来的数字，不能跨配置比较
+    （AppWorld 那边 §7/§14 已经因为跨配置比较踩过两次坑）。
+  - 40 题里唯一的 `ungrounded_action` 和 57 题里唯一的 `ungrounded_action` 都是模型连续 3 轮给出不在
+    admissible_commands 里的动作被硬终止——真实的 agent 能力问题，跟 harness 无关，样本量还小，暂不
+    单独分析。
+
+- **router/memory 接入 ALFWorld，第一次端到端跑通（2026-09-19，本机，已完成）**：
+  - **代码改动**：`RouterBuilderConfig` 新增 `domain` 字段（默认 `"appworld"`），`domain="alfworld"` 时
+    跳过 sft 计划起草（还没有 ALFWorld 版教师 prompt / guided replay 脚本，硬套 AppWorld 的
+    `apis.spotify.login` 式 prompt 只会让模型幻觉出根本不存在的 API，比不写计划更糟）；
+    `writer_rubrics.routed_writer_system()` 新增 `domain_description` 参数，让写手 prompt 的开场白从
+    "customer-service agent" 换成 "a household-task agent operating in a text-adventure environment"。
+  - 新文件 `scripts/run_alfworld_router_llm_probe.py`，照抄 `run_router_llm_probe.py` 的结构：
+    对 `base_train_v1` 的 40 题跑 `router_mode="llm"` 建 bank，再用同一批 57 题 valid_unseen 样本
+    （跟 `baseline_valid_unseen_v1` 完全同一份 task_ids）测 pass_rate，保证可比。
+  - **路由分布（40 题）**：`{'neither': 28, 'memory': 12}`，sft/both 均为 0（预期内，域内未接 sft）。
+  - **⚠️ 真实发现：写手过度 refine，12 次 memory 写入最后只剩 1 条活跃记忆**——从 position 26 起，
+    写手几乎每次都选 `refine` 指向当前唯一的活跃条目，即使话题重叠度很低（`dup_best_overlap` 低至
+    0.11-0.17，明显跟上一条不是一回事）也照样 refine，每次只保留上一条 20%-47% 的内容
+    （`refine_retention`），链式合并 9 次后从 9 条 add/refine 记录坍缩成 1 条幸存条目。这正是
+    模块注释里点名过的"v4 比不写记忆还差"那种失败模式，只是这次不是旧的强制 dedup 规则造成的，
+    是写手自己的判断倾向——猜测根因是 ALFWorld 这批任务类型窄（heat/cool/take/clean 几种程序性
+    校验经验），写手把"都是操作校验类经验"当成同一话题，倾向塞进同一条而不是像 AppWorld 那样
+    有更多不同 app/API 话题天然撑开话题空间。**尚未修复，只是测出来了**——用户明确要求先跑通全量
+    看 pipeline 能不能跑完，不要停下来纠结这个发现，所以先如实记录，修复留待下一步。
+  - **57 题 valid_unseen 对比结果**：`alfworld_experiment/router_llm_probe_v1/eval_valid_unseen57/
+    summary.json`: pass_rate = **0.7544（43/57）**，跟无记忆基线 `baseline_valid_unseen_v1` 的
+    0.7544（43/57）**总数完全打平**——但逐题对比不是巧合性的"完全没变化"：57 题里有 6 题结果不同
+    （3 题从失败变成功，3 题从成功变失败，净抵消为 0），且这 6 题里 5 题是 `pick_heat_then_place_in_recep`
+    / `pick_cool_then_place_in_recep`，跟那条幸存记忆的内容（"heat 类指令执行前先验证...")主题高度
+    相关——说明这条被过度合并、信息严重损耗的记忆确实在起作用，只是在这 57 题的小样本上恰好正负相消，
+    不能说"记忆完全没用"，也不能说"记忆有正向增量"，样本噪声下暂时不可分辨。
+  - **结论/下一步**：ALFWorld 上 router+memory 的技术管线（起草→路由→提交→检索→复用）第一次完整跑通，
+    产出了一个跟基线严格可比的数字。但 refine 过度合并的问题是真实的，如果不修，扩大训练池规模只会让
+    这条"幸存记忆"越来越通用、越来越信息稀薄——下一步要么调整 `routed_writer_system` 里对 refine 的
+    门槛提示，要么扩大训练池的任务类型多样性再看这个倾向是否是小样本假象，两个方向都还没做。
+
+- **补上 ALFWorld 的 sft 教师模型 + guided replay（2026-09-19，本机，已完成）**：
+  用户明确要求把上面跳过的 sft 路径补齐，而不是长期只有 memory 能用。
+  - **新文件 `alfworld_sft_writer.py`**：ALFWorld 版的自写手 prompt（`ALFWORLD_SFT_WRITER_SYSTEM`）和
+    教师 prompt（`GEMINI_TEACHER_SYSTEM`），针对 admissible-command 动作空间重写措辞（"go to fridge 1"
+    /"heat mug 1 with microwave 1" 这类，不再提 apis.*）；`build_writer_payload`/`validate_writer_output`
+    /`generate_plan_with_teacher` 的 Gemini 调用/重试/校验逻辑全部复用 `appworld_sft_writer.py`（给
+    `generate_plan_with_teacher` 加了 `system_prompt` 参数，默认值是 AppWorld 的 prompt，不影响现有调用），
+    没有重复实现。
+  - **新文件 `scripts/run_alfworld_guided_replay.py`**：照抄 `run_appworld_guided_replay.py` 的结构，
+    区别是要多传 `--split`（ALFWorld 的 task_id 只在单个 split 目录内唯一，不像 AppWorld 能直接查全库）。
+  - **`router_bank_builder.py`**：删掉了"domain!=appworld 就跳过 sft 起草"的临时限制，改成按
+    `config.domain` 动态 `importlib.import_module` 出 `appworld_sft_writer` 或 `alfworld_sft_writer`，
+    self/teacher 两条路径都走同一份逻辑，只是模块换了。
+  - **`router_sft_pipeline.py`** 的 `replay_and_verify`/`collect_batch_sft_examples` 加了 `domain` 参数
+    （通过 `_REPLAY_CONFIG` 字典选解释器/脚本路径/env 变量/agent prompt），默认值还是 AppWorld 的老配置，
+    `train_router_selfreward.py` 的调用点完全不用改。
+  - **`run_alfworld_router_llm_probe.py`** 加了 `--sft-writer`（teacher/self）和 sft 候选的
+    replay+verify 步骤，复用刚才泛化的 `router_sft_pipeline` 函数。
+  - **第一次真实结果（40 题 train，`sft_writer=teacher`）**：
+    ```
+    route_counts={'neither': 29, 'sft': 10, 'memory': 1}
+    sft/both committed: 10 candidate(s) to replay+verify
+    sft replay: 10 replayed, 9 verified success (yield=0.9)
+    ```
+    有 sft 选项可用之后，router 几乎不再选 memory 了（只剩 1 条，之前那批 12 条里大部分现在改选 sft）——
+    这顺带让上面记录的"refine 过度合并"问题的实际影响面变小了很多（这次只有 1 条 memory 写入，没有
+    连续 refine 的机会）。sft 候选的复核成功率 0.9（9/10）看起来比 AppWorld 那边教师模型的 0.625 高，
+    但**不是同一件事**：这 10 个 sft 选择里 8 个来自 base_agent 本来就成功的任务（巩固计划，重放时任务
+    本来就不难），只有 2 个来自失败任务（真正的修复计划）——巩固计划复核成功率天然应该远高于修复计划，
+    不能直接拿 0.9 跟 AppWorld 的 0.625（那边测的是纯失败任务的修复率）比较。真正可比的"修复率"要单独
+    看这 2 个失败任务的样本，样本量太小还看不出结论。
+  - **57 题 valid_unseen 对比评测（已完成）**：`alfworld_experiment/router_llm_probe_v2/
+    eval_valid_unseen57/summary.json`: pass_rate = **0.7193（41/57）**，比无记忆基线 0.7544（43/57）
+    低 3.51pp（41 vs 43，差 2 题）。这个评测测的仍然只是 memory bank 的效果（sft 产出进的是训练池，
+    不影响这次 retrieval-only 的评测）——这次 bank 里同样只有 1 条活跃记忆（sft 分流走了大部分本来会
+    进 memory 的任务，剩的这一条内容也跟 v1 那条不同），跟 v1 探针"1 条记忆、57 题打平"的结果对照看，
+    差 2 题的量级符合单条记忆在这个样本量下的正常噪声范围，暂时不能下"记忆拖累了效果"的结论，也不能
+    说"没用"——目前样本太小、bank 太薄，还看不出信号。
+  - **现状小结**：ALFWorld 的 sft 教师模型 + guided replay 已经补齐并跑通（10 replayed → 9 verified，
+    yield=0.9，但 8/10 是巩固计划不是修复计划，不能直接跟 AppWorld 的修复率 0.625 比）；memory 这条线
+    因为 sft 分流，这一批只写了 1 条，还没有观察到有意义的正向或负向信号。下一步如果要看清 memory 到底
+    有没有用，需要更大的训练池规模（不止 40 题）才能攒够足够多条独立记忆来看整体效果，而不是被 1-2
+    条记忆的偶然内容主导结论。
