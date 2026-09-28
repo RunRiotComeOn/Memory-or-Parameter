@@ -53,6 +53,53 @@ _REPLAY_CONFIG = {
         "env_default": "/nas04/yixuh/alfworld_data",
         "extra_args": ["--split", "train"],
     },
+    "babyai": {
+        # Runs under the repo's .venv: like webshop and tau2, the replay is
+        # only an HTTP client of a long-lived env server (AgentGym's
+        # agentenv-babyai on :36001), which is the one process needing
+        # babyai_venv.
+        "python": str(ROOT / ".venv/bin/python"),
+        "script": "scripts/run_babyai_guided_replay.py",
+        "agent_system": None,  # resolved lazily, same reason as the others
+        "env_var": None,       # the server address comes from --env-url/$BABYAI_ENV_URL
+        "env_default": None,
+        "extra_args": [],
+    },
+    "scienceworld": {
+        "python": "/nas04/yixuh/scienceworld_venv/bin/python",
+        "script": "scripts/run_scienceworld_guided_replay.py",
+        "agent_system": None,  # resolved lazily below, same reason as alfworld
+        "env_var": None,  # the scienceworld package carries its own data
+        "env_default": None,
+        # No --split: a ScienceWorld task_id ("<task_name>::<variation_id>")
+        # identifies a task outright, because train/dev/test are disjoint
+        # variation-id ranges of the same task names.
+        "extra_args": [],
+    },
+    "webshop": {
+        # Runs under the repo's .venv: the replay is only an HTTP client of
+        # the long-lived env server (scripts/webshop_env_server.py), which is
+        # the one process that needs webshop_venv. It must be the same server
+        # (same world seed) the plan's source trajectory ran against.
+        "python": str(ROOT / ".venv/bin/python"),
+        "script": "scripts/run_webshop_guided_replay.py",
+        "agent_system": None,  # resolved lazily below, like the others
+        "env_var": "WEBSHOP_ENV_URL",
+        "env_default": "http://127.0.0.1:3100",
+        # No --split: `goal_<index>` names one goal outright.
+        "extra_args": [],
+    },
+    "tau2": {
+        # tau2's own venv (Python 3.12); the Gemini key is read from its file
+        # by `tau2_agent.configure_gemini`, so no env var is needed.
+        "python": str(ROOT / "third_party/tau2-bench/.venv/bin/python"),
+        "script": "scripts/run_tau2_guided_replay.py",
+        "agent_system": None,  # unused: tau2 replays carry their own `sft_example`
+        "env_var": None,
+        "env_default": None,
+        # No --split: `<domain>::<tau2 id>` names one task outright.
+        "extra_args": [],
+    },
 }
 
 
@@ -61,6 +108,18 @@ def _agent_system_for(domain: str) -> str:
         from .alfworld_agent import AGENT_SYSTEM as ALFWORLD_AGENT_SYSTEM
 
         return ALFWORLD_AGENT_SYSTEM
+    if domain == "scienceworld":
+        from .scienceworld_agent import AGENT_SYSTEM as SCIENCEWORLD_AGENT_SYSTEM
+
+        return SCIENCEWORLD_AGENT_SYSTEM
+    if domain == "babyai":
+        from .babyai_agent import AGENT_SYSTEM as BABYAI_AGENT_SYSTEM
+
+        return BABYAI_AGENT_SYSTEM
+    if domain == "webshop":
+        from .webshop_agent import AGENT_SYSTEM as WEBSHOP_AGENT_SYSTEM
+
+        return WEBSHOP_AGENT_SYSTEM
     return AGENT_SYSTEM
 
 TRAIN_TRIGGER_SIZE = 8  # accumulate this many newly VERIFIED examples, then retrain once
@@ -105,9 +164,21 @@ def replay_and_verify(
     targets committed decisions from a train-split rollout)."""
     cfg = _REPLAY_CONFIG[domain]
     task_id = candidate["task_id"]
-    out_path = output_dir / f"{task_id.replace('/', '__')}.json"
+    # ALFWorld ids contain "/", ScienceWorld ids contain "::" -- both are
+    # flattened the same way the rollout runners flatten them, so a replay
+    # file can be matched back to its task by name. tau2 telecom ids carry
+    # "[", "|" and spaces as well, so tau2 uses its own safe stem.
+    if domain == "tau2":
+        from .tau2_agent import task_file_stem
+
+        out_path = output_dir / f"{task_file_stem(task_id)}.json"
+    else:
+        out_path = output_dir / f"{task_id.replace('/', '__').replace('::', '__')}.json"
     env = dict(os.environ)
-    env[cfg["env_var"]] = env.get(cfg["env_var"], cfg["env_default"])
+    # ScienceWorld carries its data inside the installed package, so it has no
+    # env var to point at a data directory the way AppWorld and ALFWorld do.
+    if cfg["env_var"]:
+        env[cfg["env_var"]] = env.get(cfg["env_var"], cfg["env_default"])
     env["PYTHONPATH"] = str(ROOT / "src")
     cmd = [
         cfg["python"], "-u", str(ROOT / cfg["script"]),
@@ -119,13 +190,32 @@ def replay_and_verify(
         cmd.extend(["--experiment-name", f"router_sft_replay_{task_id}"])
     if candidate.get("previous_success"):
         cmd.append("--previous-success")
-    result = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=1200)
+    # A single slow replay must not kill the whole arm. Measured: tau2's
+    # telecom tasks are long multi-turn dialogues (200-step cap, a live Gemini
+    # user on every turn) and one of them blew the 20-minute budget -- the
+    # TimeoutExpired propagated out of `collect_batch_sft_examples`, ending
+    # that arm and discarding the 56 replays already verified, because the
+    # pool is only written once at the end. One un-replayable candidate is a
+    # candidate that yields no training example, which is exactly what a
+    # `None` return already means everywhere else here.
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=1200)
+    except subprocess.TimeoutExpired:
+        print(f"  replay timed out after 1200s, skipping: {task_id}", flush=True)
+        return None
     if result.returncode != 0 or not out_path.exists():
         return None
     record = json.loads(out_path.read_text())
     trajectory = record.get("trajectory") or {}
     if not trajectory.get("success"):
         return None
+    if trajectory.get("sft_example"):
+        # Tool-calling benchmarks (tau2) record the agent's own view in
+        # OpenAI chat format with tool schemas; flattening it into
+        # `training_messages`' text shape would train on a prompt the served
+        # model never sees (see tau2_agent's module docstring).
+        return {"task_id": task_id, **trajectory["sft_example"]}
     return {
         "task_id": task_id,
         "messages": training_messages(_agent_system_for(domain), trajectory["steps"]),
@@ -153,7 +243,10 @@ def append_to_pool(pool_path: Path, examples: list[dict[str, Any]]) -> int:
     pool_path.parent.mkdir(parents=True, exist_ok=True)
     with pool_path.open("a", encoding="utf-8") as handle:
         for example in examples:
-            handle.write(json.dumps({"messages": example["messages"]}, ensure_ascii=False) + "\n")
+            row = {"messages": example["messages"]}
+            if example.get("tools"):
+                row["tools"] = example["tools"]
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     if not pool_path.exists():
         return 0
     with pool_path.open() as handle:

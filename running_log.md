@@ -468,3 +468,230 @@ gemini      救回 8/15 = 53%
     因为 sft 分流，这一批只写了 1 条，还没有观察到有意义的正向或负向信号。下一步如果要看清 memory 到底
     有没有用，需要更大的训练池规模（不止 40 题）才能攒够足够多条独立记忆来看整体效果，而不是被 1-2
     条记忆的偶然内容主导结论。
+
+- **训练池扩到 200 题（2026-09-20，本机，已完成）**：用户明确指出 40 题太少，选了 200 题规模重跑。
+  - `base_train_v2`（200 题 train，重新随机抽样，无记忆）：pass_rate = **0.69（138/200）**，
+    60 题超步数、2 题 ungrounded_action——比 40 题那批（0.825）更接近真实分布，失败样本也多得多，
+    是一个健康得多的训练池（40 题那批几乎全成功，写手没什么真正的"修复"素材可用）。
+  - **200 题 router 探针（`router_llm_probe_v3`，`sft_writer=teacher`）结果**：
+    ```
+    route_counts={'neither': 159, 'memory': 12, 'sft': 27, 'both': 2} active_entries=2
+    sft/both committed: 29 candidate(s) to replay+verify
+    sft replay: 29 replayed, 24 verified success (yield=0.828)
+    ```
+    14 次 memory 写入最后剩 2 条活跃（依然有 refine 合并，但比 40 题那次 12→1 温和一些）。
+  - **修复率 vs 巩固率拆开看（这个才是跟 AppWorld 真正可比的数字）**：29 个 sft/both 候选里
+    19 个来自本来就成功的任务（巩固计划），10 个来自本来失败的任务（真正的修复计划）：
+    ```
+    巩固（previous success=True）：18/19 = 94.7%
+    修复（previous success=False）：6/10 = 60.0%
+    ```
+    **60.0% 的修复率跟 AppWorld 教师模型那边测出的 62.5%（running_log.md §11）几乎一样**——虽然样本量都不大
+    （ALFWorld 这边 10 个，AppWorld 那边 24 个），但两个完全不同的 benchmark、完全不同的动作空间下，
+    外部教师模型修复计划的"真正让学生重跑成功"的命中率落在同一个量级，是目前为止最像"教师模型修复
+    这个机制本身有跨域普适性"的证据，而不是 AppWorld 任务本身凑巧简单。
+  - **57 题 valid_unseen 对比评测（已完成）**：`alfworld_experiment/router_llm_probe_v3/
+    eval_valid_unseen57/summary.json`: pass_rate = **0.7544（43/57）**——**第三次**跟无记忆基线
+    完全打平（v1 探针 1 条记忆：43/57；v2 探针 1 条记忆：41/57，唯一一次不是 43；这次 v3 探针 2 条
+    记忆：43/57）。逐题对比：8 题结果不同（4 升 4 降，净抵消为 0），跟前两次一样，翻的题目主要还是
+    `pick_heat_then_place_in_recep`（本次 6/8）——bank 里的记忆内容也确实是 heat 类校验经验。
+  - **一个值得记录的规律**：连续 3 次不同内容、不同条数（1/1/2 条）的极薄 bank，跑在同一批 57 题上，
+    最终 pass_rate 落点几乎完全一样（43/57 出现 2 次，41/57 一次），但具体翻转的题目每次都不同。
+    检索用的是 `--memory-top-k 3`，而 bank 里只有 1-2 条，等于**每一题都会把全部现有记忆塞进
+    prompt**，不分相关不相关——多数题目跟 heat/cool 校验完全无关，记忆内容对它们只是噪声（可能有轻微
+    干扰但通常不影响最终结果），只有真正撞上 heat/cool 类任务的那几题才会被记忆内容实质影响，往哪个
+    方向翻取决于内容措辞跟具体任务细节是否吻合，带有偶然性。**结论**：目前这么薄的 bank（1-2 条）
+    在 57 题这个样本量下，观测到的效果基本是噪声量级，既不能说记忆有用也不能说有害——bank 需要显著
+    做厚（更多训练池 → 更多独立记忆条目）才可能看出真实、可重复的信号。
+
+- **修 refine 过度合并（2026-09-20，本机，已验证有效）**：
+  - **诊断**：识别过程见上——`router_alfworld_004→005`（overlap=0.123）、`006→007`（overlap=0.176）
+    两次合并，重叠度都低于系统自己的 `REFINE_TOPIC_OVERLAP_MIN=0.25` 阈值（这个阈值只在旧的
+    `alloc_bank_builder.py` 非 router 流水线里是强制门槛，在当前 router 流水线里只是事后诊断，不
+    参与决策——写手完全看不到这两个数字），却依然被写手判定为"该合并"。对照组 `router_alfworld_009`
+    （overlap=0.063）写手正确判断为独立话题、选了 add——证明写手不是不会判断，只是在"已有一条活跃
+    记忆"时明显偏向于往里塞而不是新开一条。
+  - **修法**：在 `writer_rubrics.routed_writer_system()` 的 memory operations 说明里加了一段明确
+    提示——不能因为"大类相同"（比如都算"动作前先查校验"）就 refine，要具体到"同一个命令/同一种
+    物体receptacle类型/同一种具体错误"才该合并；否则哪怕看起来相关也该用 add，"多条窄而准的记忆
+    好过一条被反复覆写成模糊通用话的记忆"。
+  - **重跑验证（同一份 `base_train_v2` 200 题，其余配置不变，仅换了 prompt）**：
+    ```
+    v3（旧prompt）：39次memory写入(37+2 both) → 最后活跃 2 条（保留率 5%）
+    v4（新prompt）：39次memory写入(37+2 both) → 最后活跃 34 条（保留率 87%）
+    ```
+    v4 里只发生了 2 次 refine（v3 是 10 次链式合并），且这 2 次的 `dup_best_overlap` 分别是
+    0.383、0.585，**都远高于 0.25 阈值**（`would_have_forced_refine=True`）——换句话说，这两次
+    合并连旧的严格规则都会认可，之前那种"重叠度 0.123 也硬合并"的情况完全消失了。**Prompt 改动
+    有效，问题解决**。
+  - **v4 的路由分布/sft 结果**：`route_counts={'sft': 23, 'neither': 138, 'memory': 37, 'both': 2}`，
+    `sft/both committed: 25 candidate(s)`, `sft replay: 25 replayed, 21 verified success (yield=0.84)`。
+  - **下一步（用户要求）**：用 v4 最终的 34 条记忆 bank，训练一个真正的 SFT LoRA（用 v4 复核验证过的
+    样本）、合并进 `det_server_a/b`，然后在"bank 冻结 + task agent 模型已 SFT"这个最终状态下，把
+    同一批 200 题原样重放一遍，跟无记忆基线 0.69（138/200）直接对比——这是比 57 题 valid_unseen
+    泛化测试更直接的"持续学习在训练分布内到底有没有用"的证据。
+
+- **SFT LoRA 训练在这台 4x48GB 机器上卡住，连续 6 次尝试失败（2026-09-20，本机）**：
+  目标：把 v4 复核验证过的 21 条样本（`sft_pool.jsonl`）训练成真正的 LoRA、合并进 `det_server_a/b`，
+  作为"最终状态"（冻结 bank + 已训练模型）重放 200 题的前置条件。`scripts/router_sft_lora_update.sh`
+  用 `.train-venv/bin/swift sft` + deepspeed 训练——这条链路此前只在自动触发的设计里存在，从未真正
+  跑通过一次，这是第一次真实调用。
+  - **尝试 1**：2 GPU（`det_server_b` 的 2,3），plain zero3，max_length=4096，无 gradient
+    checkpointing → OOM，差 <1GiB。
+  - **尝试 2**：加 `--gradient_checkpointing true`、`--max_length 3072` → 仍 OOM，差 ~700MB。
+  - **尝试 3**：改用 4 GPU（连 `det_server_a` 的 0,1 也一起腾出来）→ **用量跟尝试 2 分毫不差**
+    （46.81GB/卡），说明 zero3 根本没把 MoE 权重按卡数切分开。
+  - **尝试 4**：`--deepspeed zero3_offload`（连优化器一起 offload 到 CPU）→ 卡在编译 `cpu_adam`：
+    系统装的 CUDA 工具链 11.5 跟 PyTorch 编译用的 12.8 不匹配，JIT 编译失败，报
+    `CUDAMismatchException`。
+  - **尝试 5**：写了 `scripts/zero3_param_offload_only.json`（只 offload 参数，优化器留在 GPU，
+    绕开 cpu_adam 编译问题），配 `--experts_impl eager`（怀疑 `grouped_mm` 把所有专家权重当一整块，
+    没法按专家逐个 gather/释放）→ **用量还是分毫不差**（46.81GB，剩 670.31MB），日志确认自定义
+    offload 配置确实被读取生效了，但显存峰值完全没变。
+  - **尝试 6（用户选的方向：QLoRA int4 量化）**：单卡（只停 `det_server_b`，`det_server_a` 全程没断，
+    这是单卡方案的好处）、`--quant_method bnb --quant_bits 4`（bitsandbytes 0.49.1 已装好）、不用
+    deepspeed → 量化配置确认正确下发（`llm_int8_skip_modules` 只跳过路由 gate 和
+    vision/lm_head，MoE 专家权重理论上会被量化），但**加载权重过程中**（1026 个张量加载到第 514 个，
+    刚好 50%）就 OOM 了，此时显存已到 47.37GB——几乎等于完整 bf16 模型体积，量化在加载阶段根本没让
+    显存降下来。
+  - **结论**：deepspeed zero3（含各种 offload 变体）和 bnb int4 量化两种完全不同的显存缩减机制，
+    在这个具体的 Qwen3.5-35B-A3B MoE 模型上都没有实际生效——每次峰值都稳定卡在 46-47GB，不随 GPU
+    数量、offload 目标、专家实现方式或量化开关变化。这强烈指向 MoE 专家权重的具体存储/访问方式
+    （可能是自定义 `nn.Parameter` 而非标准 `nn.Linear`，导致 deepspeed 的按参数切分和 bnb 的
+    按 `nn.Linear` 替换这两套机制都识别不到/处理不了专家权重）与这两套通用工具的假设不兼容，不是
+    调参能碰运气解决的。每次尝试都要重启 1-2 个 serving replica（这台集群 NFS 读取模型经常偏慢，
+    单次重启 20-40 分钟），本轮排查总计约 6 次真实失败尝试。**已恢复两个 replica 到底座模型，
+    服务未受影响**。SFT 真实训练这条路径暂时搁置，等用户决定下一步方向（换更大显存的机器/框架，
+    还是先接受"bank 冻结 + 未训练模型"作为当前可行的最终态去做 200 题重放对比）。用户选择后者。
+
+- **冻结 v4 的 34 条记忆 bank，重放同一批 200 题（未训练模型），对比无记忆基线（2026-09-20，本机，
+  已完成）**：`alfworld_experiment/freeze_replay_v4_200/summary.json`。
+  ```
+  无记忆基线 (base_train_v2):        pass_rate = 0.69  (138/200)
+  冻结34条记忆 + 未训练模型重放:      pass_rate = 0.81  (162/200)
+  ```
+  **+12pp，净增 24 道题**。逐题对比：32 道从失败变成功，8 道从成功变失败（约 4:1），160 道不变。
+  这是目前为止观测到的最大、最干净的正向信号——跟之前 57 题 valid_unseen 上"1-2 条记忆、噪声量级、
+  正负相消"的结果形成鲜明对比，说明记忆效果显著依赖 bank 厚度：34 条覆盖面足够广的独立记忆，才能
+  在这批任务分布上体现出稳定收益，1-2 条时看到的完全是噪声。
+  - **方法论检查（自我泄露）**：这批 200 题的 bank 是从这 200 题自己的轨迹里写出来的，重放时同一题
+    有可能检索到自己当初贡献的那条记忆，构成循环论证。逐一核查 32 道"变成功"的题：**只有 1 道**
+    检索到了自己来源的记忆条目，去掉这 1 道后仍是 31 升 8 降，pass_rate 161/200=0.805，结论不变。
+    自我泄露不是这个结果的主要驱动因素。
+  - **仍需说明的前提**：这次对比测的是"训练集内"效果（bank 和被测任务来自同一个 200 题池，虽然
+    自我泄露很小，但题目类型/场景分布是重叠的），不是分布外泛化能力——分布外的信号还是要看
+    valid_unseen 那条线（目前只有 1-2 条记忆时测过，没有用这批 34 条记忆重新测过 valid_unseen）。
+    下一步如果想知道这 34 条记忆能不能泛化到没见过的题，需要拿它们去重测 57 题 valid_unseen。
+
+- **用 v4 的 34 条记忆重测 57 题 valid_unseen（2026-09-21，本机，已完成）**：
+  `alfworld_experiment/router_llm_probe_v4/eval_valid_unseen57/summary.json`：
+  ```
+  无记忆基线 (baseline_valid_unseen_v1):  pass_rate = 0.7544  (43/57)
+  冻结34条记忆:                           pass_rate = 0.8947  (51/57)
+  ```
+  **+14.03pp，净增 8 道题**（9 升 1 降，47 不变）。这是 valid_unseen 这条线上第一次看到真正强烈的
+  正向信号——跟之前只有 1-2 条记忆时"噪声量级、正负相消"的三次结果完全不同。valid_unseen 的题目
+  根本没参与过建 bank，不存在自我泄露问题，这是目前为止最干净的证据：**bank 厚度是决定性变量**，
+  34 条覆盖面够广的记忆能稳定泛化到没见过的任务上，1-2 条时看到的确实只是噪声。
+
+- **对照实验：强制每题都写记忆（不经过 router 筛选），跟 router 筛选版本正面对比
+  （2026-09-21，本机，已完成）**：用户想知道"如果不筛选、每题都写，是不是比 router 挑着写更好"。
+  - **代码改动**：`RouterBuilderConfig.router_mode` 新增 `"force_memory"`——跳过路由决策，每题
+    无条件走 memory 路由；`sft_writer` 新增 `"none"`，跳过 sft 起草（省掉 200 次没用的教师模型调用）。
+    `run_alfworld_router_llm_probe.py` 加 `--router-mode` CLI 参数。
+  - **同一份 `base_train_v2` 200 题，`router_mode=force_memory`**：199/200 走 memory 路由（1 题起草
+    失败），committed 143 条活跃记忆（71.9% 存活率，跟 v4 router 版本 34/39=87% 存活率相比略低，
+    是自然结果——写的次数多了 5 倍，重复/低质量的比例也上升了）。
+  - **冻结 143 条记忆，重放同一批 200 题**：`alfworld_experiment/freeze_replay_forcemem_200/
+    summary.json`: pass_rate = **0.785（157/200）**。
+  - **三方对比**：
+    ```
+    无记忆基线：            0.69   (138/200)
+    router 筛选(34条)：     0.81   (162/200)   baseline->router: 32升8降
+    强制全写(143条)：       0.785  (157/200)   baseline->force:  25升6降
+                                                router->force:    11升16降（force比router净差5题）
+    ```
+    **强制全写比 router 筛选差**，尽管条目数是 4 倍多。直接对比 router 版本和 force 版本：
+    11 升 16 降，净负 5 题。说明 router 的筛选本身是有价值的一步，不是"记忆越多越好"——bank 里塞满
+    未经筛选的记忆后，`--memory-top-k 3` 检索有更大概率被低质量/冗余条目占掉检索位，挤掉本来会被
+    34 条精选 bank 命中的高质量条目，净效果反而下降。这是本轮所有实验里最直接回答"router 到底有没有
+    用"这个问题的证据：有用，且体现在"更少但更准"优于"更多但不筛"。
+
+  - **同一个强制全写 bank（143条）在 57 题 valid_unseen 上复测，结论一致**：
+    `alfworld_experiment/router_force_memory_v1/eval_valid_unseen57/summary.json`: pass_rate =
+    **0.8246（47/57）**，比无记忆基线 0.7544 高（+7pp），但**明显低于 router 筛选版本的
+    0.8947**（router 版本领先 4 题）。逐题对比给出更细的机制解释：
+    ```
+    baseline -> router(34条): 9升1降   (10% 的翻转是负向)
+    baseline -> force(143条): 10升6降  (37.5% 的翻转是负向)
+    router(34条) -> force(143条): 3升7降，净负4
+    ```
+    未筛选的 143 条记忆在"带来新的正确信息"这件事上不输 router 版本（升的题目数量相当），但同时引入
+    的误导/噪声明显更多（降的比例从 10% 涨到 37.5%）——这跟训练集内 200 题的模式定性一致，且是两条
+    独立证据线（训练集内 + 分布外）共同指向的结论：router 筛选降低的主要是"记忆带来负面干扰"的
+    概率，而不是单纯限制数量。
+
+## 17. 补测 AppWorld：冻结 §14 那批 14 条记忆，重放同一批 90 题 train（2026-09-21，本机，已完成）
+
+用户指出 AppWorld 当初（§14）只测过 dev 集（57题，分布外），没有像 ALFWorld 那样做"冻结 bank + 重放
+同一批训练集"的训练集内对照，补上。bank 沿用 §14 的 `router_llm_probe_v1`（90 题 train 建的，14 条
+活跃记忆，`router_mode=llm`，未训练）。`run_appworld_rollout.py --split train --task-ids <同一批90个>
+--memory-bank <14条bank> --max-parallel 1`（AppWorld 要求串行以保证确定性，90 题耗时约 3 小时）。
+
+**结果是负向的，跟 ALFWorld 完全相反**：
+```
+无记忆基线 (base_train_v2):        pass_rate = 0.6333  (57/90)
+冻结14条记忆 + 重放同一批90题:      pass_rate = 0.6     (54/90)
+```
+**-3.3pp，净减 3 题**（11 升 14 降，65 不变）。ALFWorld 那边训练集内是 34 条记忆 +12pp、143 条也有
++7.5pp（跟基线比），全部正向；AppWorld 这边 14 条记忆训练集内反而净负。
+
+**跟 §14 已有的 dev（分布外）结果对照，方向还不一致**：dev 集上这同一个 bank 是 **+5.26pp**
+（0.4737 vs 0.4211，见 §14），训练集内却是 **-3.3pp**——同一个 bank，一个方向上正、另一个方向上负，
+不是简单的"这个 bank 质量好/差"能一句话说清楚的。可能的原因（尚未验证，仅记录猜测）：
+1. AppWorld 只有 14 条记忆，跟 90 题 train 的比例（14:90）远低于 ALFWorld 34:200 或分布外 34:57——
+   `--memory-top-k 3` 检索命中率、内容匹配精度本身可能就更低更随机；
+2. DESIGN.md §13 已经量化过"AppWorld 记忆内容本身价值随候选摆动 +30pp 到 -40pp"，样本量 90/57 题
+   下这种方差被放大是完全可能的，不能排除这次的 -3.3pp 和之前的 +5.26pp 都只是同一个高方差分布里的
+   两个采样点；
+3. AppWorld 任务比 ALFWorld 复杂得多（真实 API 调用 vs 文字指令空间），同一条"经验"能不能跨具体任务
+   泛化的门槛本来就更高，14 条覆盖 90 道题的密度可能远不如 ALFWorld 的 34/143 条覆盖 200 道题。
+**尚未定论**，样本量（90/57 题）在方差这么大的信号下还不足以下结论，需要更多独立重复或更大 bank
+才能看清 AppWorld 这条线的真实效果方向。
+
+## 18. 用修复后的 memory 写手重建 AppWorld bank（`router_llm_probe_v2`），跟旧版对照（2026-09-21，本机）
+
+用户指出：§14/§17 那批 AppWorld bank 是在 refine 门槛提示修复（`writer_rubrics.py`，commit `e39acf9`，
+本来是为了修 ALFWorld 那次过度合并的问题）**之前**建的，两边现在不是同一个工具版本，需要用当前代码
+重建一次，才能公平比较。用同一个 `scripts/run_router_llm_probe.py`、同一批 90 题 train、同样的
+`router_mode=llm`、`sft_writer=teacher` 配置重新跑（`router_llm_probe_v2`）。
+
+- **重建结果**：`route_counts={'memory': 14, 'both': 21, 'sft': 24, 'neither': 31}`，
+  **`active_entries=30`**——比旧版 v1 的 14 条活跃记忆多一倍还多（35 次 memory 写入决策里 30 条存活，
+  85.7% 存活率），跟 ALFWorld 那边观察到的"改完 prompt 后存活率从 5% 升到 87%"方向一致，说明这个
+  refine 门槛修复对 AppWorld 同样有效，不是 ALFWorld 特有的巧合。
+- **57 题 dev（分布外）复测**：`router_llm_probe_v2/eval_full_dev/summary.json`: pass_rate =
+  **0.4737（27/57）**——**跟旧版 14 条记忆的结果分毫不差**，尽管新 bank 记忆数几乎翻倍。
+- **90 题 train（训练集内）复测（已完成）**：`router_llm_probe_v2/freeze_replay_train90/summary.json`:
+  pass_rate = **0.5667（51/90）**。
+  ```
+  无记忆基线：                0.6333  (57/90)
+  旧bank(14条,修复前写手)：    0.6     (54/90)   -3.3pp
+  新bank(30条,修复后写手)：    0.5667  (51/90)   -6.67pp  <- 比旧版更差
+  ```
+  **反直觉结果：refine 门槛修复让 bank 变厚（14→30条）、dev 集效果打平，但训练集内负向效果反而
+  从 -3.3pp 恶化到 -6.67pp。** 这跟 ALFWorld 的经验完全相反（那边修复后从"12次写入剩2条"变成
+  "39次写入剩34条"，训练集内效果依然强烈正向）。逐题对比看根因：
+  ```
+  baseline -> 旧bank(14条): 11升14降
+  baseline -> 新bank(30条): 6升12降   <- 升的题目数量腰斩
+  旧bank(14条) -> 新bank(30条): 10升13降，净负3
+  ```
+  新 bank 条目数翻倍，但"真正帮到具体任务"的次数（升的题目数）反而减半。一个可能的解释：refine
+  门槛提高后，很多原本会被精炼合并成一条"更通用"表述的记忆，现在变成许多条各自很窄、只覆盖极specific
+  场景的独立条目——`--memory-top-k 3` 检索时，覆盖面窄的条目命中概率更低，"广撒网但每条太窄"未必
+  比"少而通用"更容易被 BM25 命中到真正相关的具体任务。这跟 ALFWorld 的经验方向相反，可能是因为
+  AppWorld 任务空间（真实 API 调用、更长更复杂的轨迹）对"这条经验能不能命中当前任务"更敏感、
+  对泛化/具体程度的要求跟 ALFWorld 的房间/物体操作任务不一样。**这依然是初步观察，不是定论**——
+  两个benchmark目前都只有一次训练集内测量，方差未知，且 AppWorld 侧 DESIGN.md §13 已经量化过
+  记忆内容本身价值方差极大（+30pp到-40pp）。

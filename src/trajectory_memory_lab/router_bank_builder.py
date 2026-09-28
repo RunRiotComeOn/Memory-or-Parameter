@@ -229,6 +229,31 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+# Per-benchmark wiring, as tables rather than the `x if domain == "alfworld"
+# else y` pairs this started as: those read fine with two domains and become
+# wrong-by-default with three, since an unrecognized domain silently gets the
+# AppWorld branch. `.get(domain, ...["appworld"])` keeps that same default
+# explicit and in one place.
+_DOMAIN_WRITER_DESCRIPTION = {
+    "appworld": "a customer-service agent",
+    "alfworld": "a household-task agent operating in a text-adventure environment",
+    "scienceworld": "a science-experiment agent operating in a text-adventure environment",
+    "babyai": "a gridworld navigation agent operating in a text-described environment",
+    "webshop": "a shopping agent operating a simulated web store",
+    "tau2": "a customer-service agent following a written policy and calling tool APIs",
+}
+
+# domain -> (module holding the sft writer, name of its self-writer system prompt)
+_DOMAIN_SFT_WRITER = {
+    "appworld": ("appworld_sft_writer", "APPWORLD_SFT_WRITER_SYSTEM"),
+    "alfworld": ("alfworld_sft_writer", "ALFWORLD_SFT_WRITER_SYSTEM"),
+    "scienceworld": ("scienceworld_sft_writer", "SCIENCEWORLD_SFT_WRITER_SYSTEM"),
+    "babyai": ("babyai_sft_writer", "BABYAI_SFT_WRITER_SYSTEM"),
+    "webshop": ("webshop_sft_writer", "WEBSHOP_SFT_WRITER_SYSTEM"),
+    "tau2": ("tau2_sft_writer", "TAU2_SFT_WRITER_SYSTEM"),
+}
+
+
 def run_router_chain(
     router_model: RouterPolicy | None,
     group: str,
@@ -298,11 +323,8 @@ def run_router_chain(
             enable_thinking=False,
             timeout=config.timeout,
         )
-        writer_domain_description = (
-            "a household-task agent operating in a text-adventure environment"
-            if config.domain == "alfworld"
-            else "a customer-service agent"
-        )
+        writer_domain_description = _DOMAIN_WRITER_DESCRIPTION.get(
+            config.domain, _DOMAIN_WRITER_DESCRIPTION["appworld"])
         draft_reply = None
         try:
             draft_reply = client.json_chat(
@@ -343,12 +365,17 @@ def run_router_chain(
         # not one a caller-side guard should make for it; the writer is handed
         # `success` and the evaluator verdict (`build_writer_payload`) and
         # writes the appropriate kind of plan.
-        sft_writer_module = "alfworld_sft_writer" if config.domain == "alfworld" else "appworld_sft_writer"
-        self_writer_system_name = (
-            "ALFWORLD_SFT_WRITER_SYSTEM" if config.domain == "alfworld" else "APPWORLD_SFT_WRITER_SYSTEM"
-        )
+        sft_writer_module, self_writer_system_name = _DOMAIN_SFT_WRITER.get(
+            config.domain, _DOMAIN_SFT_WRITER["appworld"])
         draft_sft_plan: dict[str, Any] | None = None
-        if config.sft_writer == "teacher":
+        if config.sft_writer == "none":
+            # Skip sft drafting entirely -- for runs (e.g. router_mode=
+            # "force_memory") where the route can never be sft/both anyway,
+            # this avoids paying for 200 wasted teacher-model calls (each a
+            # real, sequential external API round-trip) that would never be
+            # used regardless of what they returned.
+            writer_output = None
+        elif config.sft_writer == "teacher":
             # External model (default: Gemini) writes the plan; the base
             # model still executes it later via guided replay. See
             # appworld_sft_writer.py's module docstring for why this is the
@@ -413,7 +440,32 @@ def run_router_chain(
 
         llm_rationale: str | None = None
         sampled_decision = None
-        if config.router_mode == "trained_llm":
+        if config.router_mode == "force_sft":
+            # Mirror ablation of "force_memory": every task commits its
+            # drafted sft plan and NOTHING is ever written to the memory
+            # bank, so the frozen end state is "empty bank + an agent trained
+            # on every plan" -- the exact complement of force_memory's
+            # "fat unfiltered bank + untrained agent". Running both against
+            # the same 200-task pool and the same no-memory baseline is what
+            # separates "the router's filtering earns its keep" from "one of
+            # the two artifacts is carrying the whole effect".
+            #
+            # A plan may still be missing (the teacher call returned None),
+            # in which case validate_alloc_decision rejects the sft side and
+            # the task simply contributes nothing -- same as an unroutable
+            # task under force_memory, and recorded the same way.
+            route, llm_rationale = "sft", "force_sft_mode"
+            logprob, entropy, probs = torch.zeros(()), torch.zeros(()), None
+        elif config.router_mode == "force_memory":
+            # Ablation: no routing decision at all -- every task commits its
+            # drafted memory, unconditionally. Used to measure the "write
+            # everything, let dedup/refine be the only filter" ceiling
+            # against the router-filtered bank, on the exact same trajectory
+            # pool -- see DESIGN.md/running_log.md for the comparison this
+            # was built for.
+            route, llm_rationale = "memory", "force_memory_mode"
+            logprob, entropy, probs = torch.zeros(()), torch.zeros(()), None
+        elif config.router_mode == "trained_llm":
             # GRPO-trainable LLM router. Unlike the "llm" mode below this has
             # a real, differentiable logprob -- but the graph is NOT retained
             # here: 80 live forward graphs of an 8B model per batch does not
@@ -489,7 +541,33 @@ def run_router_chain(
                 "router_route": route,
                 "decision": decision,
                 "draft_usage": draft_reply.usage,
+                # What the router DECLINED. `decision` deliberately nulls the
+                # content out -- `neither` commits nothing, and the bank and
+                # the sft pool must not see it -- but the drafts were paid
+                # for (one writer call, one teacher call) and thrown away,
+                # which makes the largest route in most runs the one we can
+                # say the least about. Keeping them here costs nothing at
+                # eval time (nothing reads this field) and makes the obvious
+                # follow-ups answerable offline: was the router right to
+                # decline, and how do declined drafts differ from committed
+                # ones? Stored under its own key so no consumer can mistake
+                # it for something that was committed.
+                "declined_draft": {
+                    "memory": draft_memory,
+                    "sft_plan": draft_sft_plan,
+                },
             }
+            # Whether the router HAD an sft plan to choose, independent of
+            # which route it took. Recorded on EVERY record, including the
+            # ones that commit nothing: `sft_status` is derived from the route
+            # that was taken and so cannot answer this, and the missing
+            # distinction is exactly what made DESIGN.md section 16.3's first
+            # exploration measurement read as policy collapse -- p(sft)=0 is
+            # correct judgment when there is no plan to commit, and a bug only
+            # when there is one. (First written only in the commit branch,
+            # which left it absent on precisely the `neither` records the
+            # question is about.)
+            record["drafted_sft_plan_available"] = draft_sft_plan is not None
         else:
             # Content already exists from the draft above -- just keep the
             # parts this route actually needs and force the route field, same
@@ -530,17 +608,20 @@ def run_router_chain(
                 "decision": decision,
                 "usage": draft_reply.usage,
             }
+            # Whether the router HAD an sft plan to choose, independent of
+            # which route it took. Recorded on EVERY record, including the
+            # ones that commit nothing: `sft_status` is derived from the route
+            # that was taken and so cannot answer this, and the missing
+            # distinction is exactly what made DESIGN.md section 16.3's first
+            # exploration measurement read as policy collapse -- p(sft)=0 is
+            # correct judgment when there is no plan to commit, and a bug only
+            # when there is one. (First written only in the commit branch,
+            # which left it absent on precisely the `neither` records the
+            # question is about.)
+            record["drafted_sft_plan_available"] = draft_sft_plan is not None
 
             validation = validate_alloc_decision(decision, trajectory, active_entries(bank))
             record["hard_validation"] = validation
-            # Whether the router HAD an sft plan to choose, independent of
-            # whether it chose one. `sft_status` below cannot answer this --
-            # it is derived from the route that was taken -- and the missing
-            # distinction is exactly what made DESIGN.md section 16.3's first
-            # exploration measurement read as policy collapse: p(sft)=p(both)=0
-            # is correct judgment when there is no plan to commit, and a bug
-            # only when there is one.
-            record["drafted_sft_plan_available"] = draft_sft_plan is not None
             if not validation["memory"]["required"]:
                 record["status"] = "no_write"
             elif validation["memory"]["accepted"]:

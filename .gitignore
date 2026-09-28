@@ -36,3 +36,9 @@ timewarp_*/
 router_reward_v1/*
 !router_reward_v1/DESIGN.md
 !router_reward_v1/PIPELINE.md
+
+# Benchmark experiment outputs (trajectories, banks, caches) -- regenerable, not source
+webshop_experiment/
+tau2_experiment/
+scienceworld_experiment/
+babyai_experiment/

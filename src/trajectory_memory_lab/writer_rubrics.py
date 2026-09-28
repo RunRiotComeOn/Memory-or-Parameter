@@ -261,12 +261,25 @@ order IDs, or any value specific to this task. Cite exact trajectory message ind
 
 Memory operations: choose the operation yourself, from the active memory bank you were given.
 `add` -- no active entry covers this ground. Set target_memory_id to null.
-`refine` -- an active entry is about the same thing but is incomplete or imprecise. Set
+`refine` -- an active entry is about the SAME SPECIFIC mechanism, command, API, object/receptacle
+type, or mistake as what you are about to write -- not merely the same broad theme. Set
 target_memory_id to that entry's id. Superseding drops the target from retrieval, so your content
-must carry everything the target got right PLUS what it was missing; anything you leave out is lost.
+must carry everything the target got right PLUS what it was missing; anything you leave out is lost
+for good.
 `replace` -- an active entry is wrong and should not survive. Same targeting rule.
 Prefer `refine` over `add` when adding would leave two active entries saying nearly the same thing:
 near-duplicates compete for the same retrieval slots and crowd out unrelated memories.
+
+Do NOT refine just because an active entry falls under the same broad category (e.g. both are
+about "verifying commands before acting", both are about "container state", both are about
+"inventory management"). Ask specifically: does the active entry already cover THIS exact
+mechanism/command/object type, or a different one that happens to share a topic label? If it is a
+different concrete cause -- a different command, a different object or receptacle type, a
+different edge case -- that is a DIFFERENT lesson: use `add`, even if the bank grows and even if
+the two entries read as related. Overwriting one specific, correct, narrow piece of advice to make
+room for a different specific one is worse than keeping both as separate entries: a bank of
+several narrow, accurate entries beats a single entry that keeps getting rewritten into a vaguer
+generality that no longer tells a future task anything actionable.
 
 Return exactly one JSON object:
 {{"route":"{route}","gap_type":"knowledge"|"procedure"|"both"|"none","route_rationale":STRING,"memory_operation":"add"|"refine"|"replace"|null,"target_memory_id":STRING|null,"memory":{{"content":STRING,"scope":STRING,"conditions":[STRING,...],"exceptions":[STRING,...],"evidence_steps":[INTEGER,...],"confidence":NUMBER}}|null,"sft_plan":{{"repair_target":STRING,"evidence_steps":[INTEGER,...]}}|null}}

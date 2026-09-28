@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
-"""ALFWorld counterpart of run_router_llm_probe.py -- first look at the LLM
-router (router_llm_policy.py) on the second benchmark, NOT trained.
+"""ScienceWorld counterpart of run_alfworld_router_llm_probe.py.
 
-Builds one bank over `alfworld_experiment/base_train_v1`'s 40 train
-trajectories using `RouterBuilderConfig(router_mode="llm", domain="alfworld")`
--- same model, same prompt, same payload builder as the AppWorld probe; only
-the writer's framing sentence changes (see `router_bank_builder.
-RouterBuilderConfig.domain`'s docstring). SFT drafting is skipped entirely
-for this domain (no ALFWorld teacher prompt or guided-replay script exists
-yet), so decisions can only ever land on `memory` or `neither` -- an `sft`/
-`both` pick would simply fail validation (`missing_plan`) and be recorded as
-such, not silently miscounted as a real SFT commit.
+Builds one bank over `scienceworld_experiment/base_train_v1`'s train
+trajectories with `RouterBuilderConfig(domain="scienceworld")` -- same model,
+same router prompt, same payload builder as the AppWorld and ALFWorld probes;
+what changes per domain is the writer's framing sentence and which
+`*_sft_writer` module supplies the teacher prompt, both looked up by
+`router_bank_builder`'s domain tables.
 
-Reports the route distribution and, optionally, the real 57-task
-valid_unseen pass_rate for the resulting bank, directly comparable to
-`alfworld_experiment/baseline_valid_unseen_v1/summary.json` (no-memory
-baseline, same 57 task_ids, same replica/config) -- running_log.md section
-15 already flags that any "did memory help" claim must reuse that exact
-baseline rather than a fresh one.
+Unlike the first ALFWorld probe, the sft path is live from the start:
+`scienceworld_sft_writer` and `run_scienceworld_guided_replay.py` exist, so
+`sft`/`both` are real routes here and their candidates are replayed and
+verified rather than failing validation as `missing_plan`.
 
-Run (from the repo's default .venv, NOT alfworld_venv310 -- this script only
-calls into trajectory_memory_lab and subprocess-launches the ALFWorld eval
-under the right interpreter itself):
-  PYTHONPATH=src python3 -u scripts/run_alfworld_router_llm_probe.py \
-      --output alfworld_experiment/router_llm_probe_v1 \
-      --base-url http://127.0.0.1:8000/v1 --run-dev-eval
+`--router-mode` selects the ablation: "llm" is the router deciding, and
+"force_memory"/"force_sft" are the two forced arms that
+`alfworld_summary.md` defines -- every task commits its drafted memory with
+nothing ever reaching the sft pool, or every task commits its drafted plan
+with the bank left empty.
+
+The optional held-out eval scores the resulting bank on the same 57 `test`
+tasks as `scienceworld_experiment/baseline_test57`, the no-memory baseline.
+ScienceWorld's train/dev/test are disjoint variation-id ranges of the same 30
+task names, so `test` is the out-of-distribution line here, matching what
+`valid_unseen` is for ALFWorld.
+
+Run from the repo's default .venv (NOT scienceworld_venv -- this script only
+calls into trajectory_memory_lab and subprocess-launches the ScienceWorld
+rollout under the right interpreter itself):
+  PYTHONPATH=src .venv/bin/python -u scripts/run_scienceworld_router_llm_probe.py \
+      --output scienceworld_experiment/router_llm_probe_v1 \
+      --base-url http://127.0.0.1:8030/v1 --run-dev-eval
 """
 
 from __future__ import annotations
@@ -48,10 +54,9 @@ from trajectory_memory_lab.router_sft_pipeline import (  # noqa: E402
     sft_candidates_from_records,
 )
 
-GROUP = "alfworld"
-ALFWORLD_PYTHON = "/nas04/yixuh/alfworld_venv310/bin/python"
-ALFWORLD_DATA_DEFAULT = "/nas04/yixuh/alfworld_data"
-EVAL_TASK_IDS_FILE = Path("/tmp/alfworld_unseen57_lines.txt")
+GROUP = "scienceworld"
+SCIENCEWORLD_PYTHON = "/nas04/yixuh/scienceworld_venv/bin/python"
+EVAL_TASK_IDS_FILE = Path("/tmp/sw_test57.txt")
 
 
 def read_json(path: Path) -> Any:
@@ -80,8 +85,8 @@ def load_train_trajectories(train_rollout: Path) -> dict[str, dict[str, Any]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=ROOT / "alfworld_experiment/router_llm_probe_v1")
-    parser.add_argument("--train-rollout", type=Path, default=ROOT / "alfworld_experiment/base_train_v2")
+    parser.add_argument("--output", type=Path, default=ROOT / "scienceworld_experiment/router_llm_probe_v1")
+    parser.add_argument("--train-rollout", type=Path, default=ROOT / "scienceworld_experiment/base_train_v1")
     parser.add_argument("--model", default="qwen35-tau", help="task agent + memory draft writer + router")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--limit", type=int, default=0, help="0 = all 40 train tasks; >0 truncates for a quick look")
@@ -97,7 +102,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--run-dev-eval", action="store_true",
-        help="also score the resulting bank on the same 57-task valid_unseen sample as baseline_valid_unseen_v1",
+        help="also score the resulting bank on the same 57-task test sample as baseline_test57",
     )
     args = parser.parse_args()
 
@@ -106,15 +111,15 @@ def main() -> None:
     if args.limit > 0:
         task_ids = task_ids[: args.limit]
     print(
-        f"router_mode={args.router_mode} domain=alfworld ({args.model}), {len(task_ids)} train tasks, sft_writer={args.sft_writer}",
+        f"router_mode={args.router_mode} domain=scienceworld ({args.model}), {len(task_ids)} train tasks, sft_writer={args.sft_writer}",
         flush=True,
     )
 
     config = RouterBuilderConfig(
-        output=args.output, record_protocol="alfworld_router_llm_probe_v1",
+        output=args.output, record_protocol="scienceworld_router_llm_probe_v1",
         model=args.model, base_url=args.base_url,
         sft_writer=args.sft_writer,
-        router_mode=args.router_mode, domain="alfworld",
+        router_mode=args.router_mode, domain="scienceworld",
     )
     result = run_router_chain(
         None, GROUP, task_ids, trajectories, config, total_task_count=len(task_ids),
@@ -128,7 +133,7 @@ def main() -> None:
     print(f"  base_agent failure -> routes: {dict(by_success[False])}", flush=True)
 
     summary = {
-        "protocol": "alfworld_router_llm_probe_v1",
+        "protocol": "scienceworld_router_llm_probe_v1",
         "router_llm_model": args.model,
         "task_count": len(task_ids),
         "route_counts": dict(route_counts),
@@ -143,7 +148,7 @@ def main() -> None:
         replay_dir = args.output / "sft_replays"
         sft_examples = collect_batch_sft_examples(
             result.summary["records"], replay_dir, args.model, args.base_url,
-            seed=20260919, domain="alfworld",
+            seed=20260922, domain="scienceworld",
         )
         summary["sft_candidates_replayed"] = len(candidates)
         summary["sft_examples_verified"] = len(sft_examples)
@@ -162,25 +167,24 @@ def main() -> None:
 
     if args.run_dev_eval:
         bank_path = args.output / "banks" / f"memory_{GROUP}.json"
-        eval_dir = args.output / "eval_valid_unseen57"
+        eval_dir = args.output / "eval_test57"
         eval_task_ids = EVAL_TASK_IDS_FILE.read_text().split()
         env = dict(os.environ)
-        env["ALFWORLD_DATA"] = env.get("ALFWORLD_DATA", ALFWORLD_DATA_DEFAULT)
         cmd = [
-            ALFWORLD_PYTHON, "-u", str(ROOT / "scripts/run_alfworld_rollout.py"),
-            "--split", "valid_unseen", "--output", str(eval_dir),
-            "--experiment-name", "alfworld_router_llm_probe_v1_eval",
+            SCIENCEWORLD_PYTHON, "-u", str(ROOT / "scripts/run_scienceworld_rollout.py"),
+            "--split", "test", "--output", str(eval_dir),
+            "--experiment-name", "scienceworld_router_llm_probe_v1_eval",
             "--task-ids", *eval_task_ids,
             "--memory-bank", str(bank_path), "--memory-top-k", "3",
-            "--max-parallel", "4", "--max-steps", "40",
+            "--max-parallel", "4", "--max-steps", "30",
             "--model", args.model, "--base-url", args.base_url,
         ]
-        print(f"launching real valid_unseen eval ({len(eval_task_ids)} tasks, same sample as baseline_valid_unseen_v1)", flush=True)
+        print(f"launching real test-split eval ({len(eval_task_ids)} tasks, same sample as baseline_test57)", flush=True)
         result_proc = subprocess.run(cmd, cwd=str(ROOT), env=env)
         if result_proc.returncode == 0:
             dev_summary = read_json(eval_dir / "summary.json")
-            summary["valid_unseen_pass_rate"] = dev_summary["pass_rate"]
-            print(f"valid_unseen_pass_rate={dev_summary['pass_rate']:.4f}", flush=True)
+            summary["test57_pass_rate"] = dev_summary["pass_rate"]
+            print(f"test57_pass_rate={dev_summary['pass_rate']:.4f}", flush=True)
 
     write_json(args.output / "summary.json", summary)
     print(f"wrote {args.output / 'summary.json'}", flush=True)

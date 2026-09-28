@@ -81,46 +81,6 @@ controller owns whether `edit_memory` is called. Once called, the Memory Writer 
 more concrete operations; the independent audit and deterministic validator may still reject all
 of them. The SFT specialist may abstain when no complete episode is available.
 
-## Memory Writer utility harness
-
-`generate_tau_memory_writer_candidates.py` is a pre-routing utility-data collector. It samples
-successful and failed source trajectories from the tau train split, generates multiple isolated
-add/noop candidates, applies deterministic
-evidence and identifier checks, and selects related plus low-overlap train-validation tasks.
-`run_tau_memory_writer_replay.py` evaluates each accepted candidate with fixed BM25 retrieval,
-reuses the existing no-memory base runs as paired controls, and writes harm-weighted utility and
-preference pairs. The final tau test split is never used to create these training labels.
-Candidates from one source share the same utility tasks: two related baseline failures provide
-uplift opportunities, while one related and two scope-control baseline successes expose
-regressions. Preference records include the common Writer input as well as chosen and rejected
-outputs, so they can be converted to SFT or preference-training data without reconstructing the
-source trajectory.
-
-## Memory Writer warm-start SFT
-
-Build SFT data from audited memory operations that also pass deterministic evidence and
-application checks:
-
-```bash
-PYTHONPATH=src .venv/bin/python scripts/prepare_tau_memory_writer_sft.py \
-  --output training/tau_memory_writer_sft_v2
-
-EPOCHS=3 MAX_LENGTH=13000 \
-  bash scripts/train_tau_memory_writer_verl.sh \
-  training/tau_memory_writer_sft_v2/train.parquet \
-  training/tau_memory_writer_sft_v2_lora
-```
-
-The preparation step is conditioned on a correct controller call: writer SFT contains only
-audited, executable add/refine/replace operations. Empty outcomes are excluded from writer SFT
-and saved separately in `controller_routing_outcomes.jsonl` as candidate routing outcomes, not
-trusted negative labels. They require separate controller evaluation because an old writer or
-auditor failure can also produce an empty outcome. The preparation step keeps
-cited evidence and refine targets visible while compacting long trajectories and creates a
-source-disjoint positive validation split. Replace remains in the writer schema but is not used
-as an SFT label until an audited, executable replace example is available. Downstream replay
-utility is reserved for later preference or GRPO training.
-
 ## VERL action SFT
 
 Convert an audited action JSONL file and train a Qwen3.5 LoRA with assistant-action-only loss:

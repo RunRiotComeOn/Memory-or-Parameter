@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""ALFWorld counterpart of run_router_llm_probe.py -- first look at the LLM
-router (router_llm_policy.py) on the second benchmark, NOT trained.
+"""tau2-bench counterpart of run_webshop_router_llm_probe.py.
 
-Builds one bank over `alfworld_experiment/base_train_v1`'s 40 train
-trajectories using `RouterBuilderConfig(router_mode="llm", domain="alfworld")`
--- same model, same prompt, same payload builder as the AppWorld probe; only
-the writer's framing sentence changes (see `router_bank_builder.
-RouterBuilderConfig.domain`'s docstring). SFT drafting is skipped entirely
-for this domain (no ALFWorld teacher prompt or guided-replay script exists
-yet), so decisions can only ever land on `memory` or `neither` -- an `sft`/
-`both` pick would simply fail validation (`missing_plan`) and be recorded as
-such, not silently miscounted as a real SFT commit.
+Builds one bank per tau2 domain (`--domain airline|retail|telecom`, bank
+`memory_tau2_<domain>.json`) over a tau2 TRAIN-split rollout
+(`scripts/run_tau2_rollout.py`), with `RouterBuilderConfig(domain="tau2")` --
+same model, router prompt and payload builder as the other probes; per
+domain only the writer's framing sentence and the `tau2_sft_writer` prompts
+change.
 
-Reports the route distribution and, optionally, the real 57-task
-valid_unseen pass_rate for the resulting bank, directly comparable to
-`alfworld_experiment/baseline_valid_unseen_v1/summary.json` (no-memory
-baseline, same 57 task_ids, same replica/config) -- running_log.md section
-15 already flags that any "did memory help" claim must reuse that exact
-baseline rather than a fresh one.
+`--router-mode` selects the ablation exactly as for the other benchmarks:
+"llm", "force_memory", "force_sft".
 
-Run (from the repo's default .venv, NOT alfworld_venv310 -- this script only
-calls into trajectory_memory_lab and subprocess-launches the ALFWorld eval
-under the right interpreter itself):
-  PYTHONPATH=src python3 -u scripts/run_alfworld_router_llm_probe.py \
-      --output alfworld_experiment/router_llm_probe_v1 \
-      --base-url http://127.0.0.1:8000/v1 --run-dev-eval
+Each trajectory's `sft_example` (the agent's full prompt: policy + tool
+schemas, several thousand tokens) is dropped before routing: the router and
+memory writer see the trajectory itself, and would otherwise be handed the
+same policy text again for every task. Guided replays produce their own.
+
+The optional held-out eval (`--run-eval`) scores the bank on the domain's
+tau2 `test` split with the same user simulator.
+
+Run from the repo's default .venv (sft replays and the eval subprocess
+launch under tau2's venv themselves):
+  PYTHONPATH=src .venv/bin/python -u scripts/run_tau2_router_llm_probe.py --domain airline \
+      --train-rollout tau2_experiment/airline_base_train_v1 \
+      --output tau2_experiment/airline_router_llm_probe_v1 \
+      --base-url http://127.0.0.1:8030/v1 --run-eval
 """
 
 from __future__ import annotations
@@ -48,10 +48,7 @@ from trajectory_memory_lab.router_sft_pipeline import (  # noqa: E402
     sft_candidates_from_records,
 )
 
-GROUP = "alfworld"
-ALFWORLD_PYTHON = "/nas04/yixuh/alfworld_venv310/bin/python"
-ALFWORLD_DATA_DEFAULT = "/nas04/yixuh/alfworld_data"
-EVAL_TASK_IDS_FILE = Path("/tmp/alfworld_unseen57_lines.txt")
+TAU2_PYTHON = str(ROOT / "third_party/tau2-bench/.venv/bin/python")
 
 
 def read_json(path: Path) -> Any:
@@ -63,7 +60,7 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def load_train_trajectories(train_rollout: Path) -> dict[str, dict[str, Any]]:
+def load_train_trajectories(train_rollout: Path, group: str) -> dict[str, dict[str, Any]]:
     protocol = read_json(train_rollout / "protocol.json")
     if protocol.get("split") != "train":
         raise ValueError(f"expected split=train, got {protocol.get('split')!r}")
@@ -73,18 +70,19 @@ def load_train_trajectories(train_rollout: Path) -> dict[str, dict[str, Any]]:
         if record.get("status") != "complete":
             continue
         trajectory = record["trajectory"]
-        trajectory["domain"] = GROUP
+        trajectory.pop("sft_example", None)
+        trajectory["domain"] = group
         trajectories[record["task_id"]] = trajectory
     return trajectories
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=ROOT / "alfworld_experiment/router_llm_probe_v1")
-    parser.add_argument("--train-rollout", type=Path, default=ROOT / "alfworld_experiment/base_train_v2")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--train-rollout", type=Path, required=True, help="a run_tau2_rollout.py --split train output")
     parser.add_argument("--model", default="qwen35-tau", help="task agent + memory draft writer + router")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
-    parser.add_argument("--limit", type=int, default=0, help="0 = all 40 train tasks; >0 truncates for a quick look")
+    parser.add_argument("--limit", type=int, default=0, help="0 = every train task in the rollout; >0 truncates for a quick look")
     parser.add_argument("--sft-writer", choices=("teacher", "self", "none"), default="teacher")
     parser.add_argument(
         "--router-mode", choices=("llm", "force_memory", "force_sft"), default="llm",
@@ -95,29 +93,34 @@ def main() -> None:
         "--skip-sft-replay", action="store_true",
         help="don't replay+verify committed sft/both decisions (route counts and the memory bank still work without this)",
     )
+    parser.add_argument("--domain", choices=("airline", "retail", "telecom"), required=True)
     parser.add_argument(
-        "--run-dev-eval", action="store_true",
-        help="also score the resulting bank on the same 57-task valid_unseen sample as baseline_valid_unseen_v1",
+        "--run-eval", action="store_true",
+        help="also score the resulting bank on the domain's tau2 test split",
     )
     args = parser.parse_args()
 
-    trajectories = load_train_trajectories(args.train_rollout)
+    group = f"tau2_{args.domain}"
+    protocol = read_json(args.train_rollout / "protocol.json")
+    if protocol.get("domain") != args.domain:
+        raise SystemExit(f"--domain {args.domain} but the train rollout is {protocol.get('domain')!r}")
+    trajectories = load_train_trajectories(args.train_rollout, group)
     task_ids = sorted(trajectories)
     if args.limit > 0:
         task_ids = task_ids[: args.limit]
     print(
-        f"router_mode={args.router_mode} domain=alfworld ({args.model}), {len(task_ids)} train tasks, sft_writer={args.sft_writer}",
+        f"router_mode={args.router_mode} domain=tau2/{args.domain} ({args.model}), {len(task_ids)} train tasks, sft_writer={args.sft_writer}",
         flush=True,
     )
 
     config = RouterBuilderConfig(
-        output=args.output, record_protocol="alfworld_router_llm_probe_v1",
+        output=args.output, record_protocol="tau2_router_llm_probe_v1",
         model=args.model, base_url=args.base_url,
         sft_writer=args.sft_writer,
-        router_mode=args.router_mode, domain="alfworld",
+        router_mode=args.router_mode, domain="tau2",
     )
     result = run_router_chain(
-        None, GROUP, task_ids, trajectories, config, total_task_count=len(task_ids),
+        None, group, task_ids, trajectories, config, total_task_count=len(task_ids),
     )
     route_counts = Counter(d["route"] for d in result.decisions)
     by_success: dict[bool, Counter] = {True: Counter(), False: Counter()}
@@ -128,7 +131,8 @@ def main() -> None:
     print(f"  base_agent failure -> routes: {dict(by_success[False])}", flush=True)
 
     summary = {
-        "protocol": "alfworld_router_llm_probe_v1",
+        "protocol": "tau2_router_llm_probe_v1",
+        "tau2_domain": args.domain,
         "router_llm_model": args.model,
         "task_count": len(task_ids),
         "route_counts": dict(route_counts),
@@ -143,7 +147,7 @@ def main() -> None:
         replay_dir = args.output / "sft_replays"
         sft_examples = collect_batch_sft_examples(
             result.summary["records"], replay_dir, args.model, args.base_url,
-            seed=20260919, domain="alfworld",
+            seed=20260922, domain="tau2",
         )
         summary["sft_candidates_replayed"] = len(candidates)
         summary["sft_examples_verified"] = len(sft_examples)
@@ -160,27 +164,24 @@ def main() -> None:
             flush=True,
         )
 
-    if args.run_dev_eval:
-        bank_path = args.output / "banks" / f"memory_{GROUP}.json"
-        eval_dir = args.output / "eval_valid_unseen57"
-        eval_task_ids = EVAL_TASK_IDS_FILE.read_text().split()
+    if args.run_eval:
+        bank_path = args.output / "banks" / f"memory_{group}.json"
+        eval_dir = args.output / "eval_test"
         env = dict(os.environ)
-        env["ALFWORLD_DATA"] = env.get("ALFWORLD_DATA", ALFWORLD_DATA_DEFAULT)
+        env["PYTHONPATH"] = str(ROOT / "src")
         cmd = [
-            ALFWORLD_PYTHON, "-u", str(ROOT / "scripts/run_alfworld_rollout.py"),
-            "--split", "valid_unseen", "--output", str(eval_dir),
-            "--experiment-name", "alfworld_router_llm_probe_v1_eval",
-            "--task-ids", *eval_task_ids,
+            TAU2_PYTHON, "-u", str(ROOT / "scripts/run_tau2_rollout.py"),
+            "--domain", args.domain, "--split", "test", "--output", str(eval_dir),
             "--memory-bank", str(bank_path), "--memory-top-k", "3",
-            "--max-parallel", "4", "--max-steps", "40",
+            "--max-parallel", "4",
             "--model", args.model, "--base-url", args.base_url,
         ]
-        print(f"launching real valid_unseen eval ({len(eval_task_ids)} tasks, same sample as baseline_valid_unseen_v1)", flush=True)
+        print(f"launching {args.domain} test-split eval", flush=True)
         result_proc = subprocess.run(cmd, cwd=str(ROOT), env=env)
         if result_proc.returncode == 0:
-            dev_summary = read_json(eval_dir / "summary.json")
-            summary["valid_unseen_pass_rate"] = dev_summary["pass_rate"]
-            print(f"valid_unseen_pass_rate={dev_summary['pass_rate']:.4f}", flush=True)
+            eval_summary = read_json(eval_dir / "summary.json")
+            summary["eval_test_pass_rate"] = eval_summary["pass_rate"]
+            print(f"eval_test: pass_rate={eval_summary['pass_rate']:.4f}", flush=True)
 
     write_json(args.output / "summary.json", summary)
     print(f"wrote {args.output / 'summary.json'}", flush=True)
