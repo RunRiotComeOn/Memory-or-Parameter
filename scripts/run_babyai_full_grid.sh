@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # End-to-end driver for the BabyAI arm of the memory/SFT ablation grid.
 #
-# Runs EVERYTHING that is left, in order, for all three sub-domains:
-#   A. nine build arms      (3 domains x router / force_memory / force_sft)
-#   B. six LoRA trainings   (3 domains x router-pool / force_sft-pool)
-#   C. six merges           (each LoRA re-keyed and merged into a full model)
-#   D. eighteen evaluations (3 domains x 6 configurations)
+# Runs EVERYTHING that is left, in order. BabyAI is a single domain, so the
+# parallelism that tau2 got from its three sub-domains comes here from the
+# three build arms instead: one arm per serving replica.
+#   0. the held-out baseline rollout (80 test tasks), if not already there
+#   A. three build arms     (router / force_memory / force_sft), one per replica
+#   B. two LoRA trainings   (router-pool, force_sft-pool)
+#   C. two merges           (each LoRA re-keyed and merged into a full model)
+#   D. five evaluations     (the other five cells of the six-point grid)
 #
 # Every step is SKIPPED if its output already exists, so this can be started
 # while phase A is already running from an earlier launch, and re-run after
@@ -36,7 +39,13 @@ PY=.venv/bin/python
 BENCH_PY=.venv/bin/python
 ROUTER_PY=/nas04/yixuh/router_venv/bin/python
 OUT=babyai_experiment
-DOMAINS=(babyai)
+DOM=babyai
+ENV_URL=http://127.0.0.1:36001   # AgentGym babyai env server (tmux: babyai_env)
+# The held-out set is every task with layout seed 20-21, i.e. all forty levels
+# twice over. The earlier `baseline_test57` covered only 57 of those 80 for no
+# recorded reason, so phase 0 re-measures the baseline on the full split and
+# every arm is scored on exactly the same 80 tasks.
+EVAL_STEPS=15                    # agent turns; must equal the baseline's
 KEEP_MERGED="${KEEP_MERGED:-0}"   # set to 1 to keep the 66GB merged models
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -50,7 +59,29 @@ serve() {
   current=$(curl -s -m 5 "http://127.0.0.1:$port/v1/models" 2>/dev/null \
             | $PY -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["root"])' 2>/dev/null || true)
   if [[ "$current" == "$model" ]]; then log "serve: $port already on $(basename "$model")"; return 0; fi
-  tmux kill-session -t "$sess" 2>/dev/null; sleep 5
+  # Stop whatever actually holds this port, not just the session name this
+  # script would have used. Sessions from earlier benchmarks linger under
+  # their own names (tau2_srv_b was still serving 8031 here), so killing
+  # "$sess" alone leaves the old vLLM running and the identity check below
+  # then aborts on a server that was never replaced. This is the same
+  # wrong-session-name bug that silently CPU-offloaded six LoRA trainings
+  # on the tau2 run; fixing it only for GPUs was not enough.
+  tmux kill-session -t "$sess" 2>/dev/null
+  local holder
+  holder=$(ss -lptnH "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)
+  if [[ -n "${holder:-}" ]]; then
+    log "serve: port $port held by pid $holder; stopping it"
+    kill "$holder" 2>/dev/null
+  fi
+  for _ in $(seq 90); do
+    curl -s -m 3 "http://127.0.0.1:$port/v1/models" -o /dev/null 2>/dev/null || break
+    sleep 2
+  done
+  if curl -s -m 3 "http://127.0.0.1:$port/v1/models" -o /dev/null 2>/dev/null; then
+    log "ABORT: $port still serving after 180s; refusing to start a second server on it"
+    exit 1
+  fi
+  sleep 5
   log "serve: $port <- $(basename "$model") on GPU $gpus"
   tmux new-session -d -s "$sess" \
     "CUDA_VISIBLE_DEVICES=$gpus TENSOR_PARALLEL_SIZE=2 GPU_MEMORY_UTILIZATION=0.85 PORT=$port \
@@ -67,36 +98,68 @@ serve() {
   log "serve: $port ready on $(basename "$model")"
 }
 
+# --- phase 0: held-out baseline -------------------------------------------
+phase_0() {
+  local dir="$OUT/baseline_test80"
+  [[ -f "$dir/summary.json" ]] && { log "skip baseline (done)"; return 0; }
+  log "=== PHASE 0: baseline on the full 80-task test split ==="
+  serve ba_srv_a 0,1 8030 "$BASE"
+  $BENCH_PY -u scripts/run_babyai_rollout.py --split test --output "$dir" \
+      --experiment-name babyai_baseline_test80 --env-url "$ENV_URL" \
+      --max-parallel 4 --max-steps "$EVAL_STEPS" --seed 20260822 \
+      --model qwen35-tau --base-url http://127.0.0.1:8030/v1 \
+      > "$OUT/baseline_test80.log" 2>&1 \
+    || { log "ABORT: baseline rollout failed (see $OUT/baseline_test80.log)"; exit 1; }
+  log "=== PHASE 0 done ==="
+}
+
 # --- phase A: builds -------------------------------------------------------
 build_arm() {
   local dom=$1 arm=$2 url=$3 mode=$4 writer=$5
   local dir="$OUT/${dom}_${arm}"
   [[ -f "$dir/summary.json" ]] && { log "skip build $dom/$arm (done)"; return 0; }
   log "build $dom/$arm (mode=$mode writer=$writer)"
-  $PY -u scripts/run_babyai_router_llm_probe.py --domain "$dom" --output "$dir" \
-      --train-rollout "$OUT/${dom}_base_train" --router-mode "$mode" \
-      --sft-writer "$writer" --base-url "$url"
+  # No --domain: BabyAI is a single domain and its probe script has no such
+  # flag (tau2's does, and the leftover argument silently failed all three
+  # arms here with an argparse usage error).
+  $PY -u scripts/run_babyai_router_llm_probe.py --output "$dir" \
+      --train-rollout "$OUT/base_train_v1" --router-mode "$mode" \
+      --sft-writer "$writer" --base-url "$url" --env-url "$ENV_URL" || {
+    log "ABORT: build $dom/$arm failed"; return 1; }
+  [[ -f "$dir/summary.json" ]] || { log "ABORT: build $dom/$arm wrote no summary"; return 1; }
 }
 
 phase_a() {
-  log "=== PHASE A: nine build arms ==="
+  log "=== PHASE A: three build arms, one per replica ==="
   serve ba_srv_a 0,1 8030 "$BASE"
   serve ba_srv_b 4,5 8031 "$BASE"
   serve ba_srv_c 6,7 8032 "$BASE"
   local pids=()
-  local i=0
-  for dom in "${DOMAINS[@]}"; do
-    local port=$((8030 + i)); i=$((i+1))
-    (
-      build_arm "$dom" router_probe  "http://127.0.0.1:$port/v1" llm          teacher
-      build_arm "$dom" force_memory  "http://127.0.0.1:$port/v1" force_memory none
-      build_arm "$dom" force_sft     "http://127.0.0.1:$port/v1" force_sft    teacher
-    ) > "$OUT/phaseA_${dom}.log" 2>&1 &
+  # tau2 parallelised by sub-domain and ran its three arms sequentially on one
+  # replica. There is only one domain here, so the arms take that place: each
+  # gets its own replica and all three run at once. They are independent --
+  # different router mode, different output dir, same read-only train rollout.
+  local arms=("router_probe 8030 llm teacher"
+              "force_memory 8031 force_memory none"
+              "force_sft    8032 force_sft teacher")
+  local spec
+  for spec in "${arms[@]}"; do
+    # shellcheck disable=SC2086
+    set -- $spec
+    build_arm "$DOM" "$1" "http://127.0.0.1:$2/v1" "$3" "$4" > "$OUT/phaseA_$1.log" 2>&1 &
     pids+=($!)
   done
   local rc=0
   for p in "${pids[@]}"; do wait "$p" || rc=1; done
   log "=== PHASE A done (rc=$rc) ==="
+  if [[ "$rc" != "0" ]]; then
+    # Continuing past a failed build arm is what produced a "COMPLETE" run
+    # with every LoRA skipped and every eval missing: the downstream skips
+    # are all conditioned on artifacts that a failed arm never wrote, so
+    # nothing errors, it just does nothing. Stop here instead.
+    log "ABORT: phase A had failures; not continuing to B/C/D (see $OUT/phaseA_*.log)"
+    exit 1
+  fi
 }
 
 # --- phase B/C: LoRA + merge ----------------------------------------------
@@ -141,7 +204,7 @@ PYV
 }
 
 phase_bc() {
-  log "=== PHASE B/C: six LoRAs + merges ==="
+  log "=== PHASE B/C: two LoRAs + merges ==="
   # Free GPU 6,7 for LoRA training. Killing one known session name is not
   # enough: whichever session happens to serve port 8032 may have been
   # started by an earlier benchmark under a different name (it was
@@ -163,10 +226,8 @@ phase_bc() {
     exit 1
   fi
   log "GPU 6,7 free (${used}MiB) -- starting LoRA training"
-  for dom in "${DOMAINS[@]}"; do
-    train_and_merge "$dom" router_probe
-    train_and_merge "$dom" force_sft
-  done
+  train_and_merge "$DOM" router_probe
+  train_and_merge "$DOM" force_sft
   log "=== PHASE B/C done ==="
 }
 
@@ -181,8 +242,15 @@ eval_one() {
     fi
     log "redoing eval $dom/$name (previous run has a null pass_rate)"; rm -rf "$dir"
   fi
-  local args=(--domain "$dom" --split test --output "$dir"
-              --max-parallel 4 --max-steps 200 --seed 20260822
+  # run_babyai_rollout.py has no --domain (BabyAI is one domain) and REQUIRES
+  # --experiment-name; the tau2 argument list left here failed all five evals
+  # instantly with an argparse error. --max-steps must stay equal to the
+  # baseline's: it counts agent turns, two thirds of the baseline's failures
+  # are `max_steps`, and raising it for one arm alone would hand that arm the
+  # difference.
+  local args=(--split test --output "$dir" --experiment-name "babyai_${name}"
+              --env-url "$ENV_URL"
+              --max-parallel 4 --max-steps "$EVAL_STEPS" --seed 20260822
               --model qwen35-tau --base-url "$url")
   if [[ -n "$bank" ]]; then
     # A wrong bank path does not stop the rollout: every task fails with
@@ -199,18 +267,18 @@ eval_one() {
 }
 
 phase_d() {
-  log "=== PHASE D: eighteen evaluations ==="
+  log "=== PHASE D: five evaluations ==="
   serve ba_srv_a 0,1 8030 "$BASE"
 
   # base-model configs for every domain, on replica A
-  ( for dom in "${DOMAINS[@]}"; do
+  ( for dom in "$DOM"; do
       eval_one routermem  "$dom" http://127.0.0.1:8030/v1 "$OUT/${dom}_router_probe/banks/memory_babyai.json"
       eval_one forcemem   "$dom" http://127.0.0.1:8030/v1 "$OUT/${dom}_force_memory/banks/memory_babyai.json"
     done ) > "$OUT/phaseD_base.log" 2>&1 &
   local pid_base=$!
 
   # per-domain merged models, on replicas B (router) and C (force_sft)
-  ( for dom in "${DOMAINS[@]}"; do
+  ( for dom in "$DOM"; do
       m="/nas04/yixuh/ba_${dom}_router_probe_merged"
       [[ -f "$m/config.json" ]] || { log "skip $dom router evals (no merged model)"; continue; }
       serve ba_srv_b 4,5 8031 "$m"
@@ -220,7 +288,7 @@ phase_d() {
     done ) > "$OUT/phaseD_router.log" 2>&1 &
   local pid_router=$!
 
-  ( for dom in "${DOMAINS[@]}"; do
+  ( for dom in "$DOM"; do
       m="/nas04/yixuh/ba_${dom}_force_sft_merged"
       [[ -f "$m/config.json" ]] || { log "skip $dom force_sft eval (no merged model)"; continue; }
       serve ba_srv_c 6,7 8032 "$m"
@@ -240,10 +308,10 @@ report() {
   $PY - <<'PYR'
 import json, os
 OUT = "babyai_experiment"
-rows = [("baseline", "baseline_test57"), ("router mem", "eval_babyai_routermem"),
+rows = [("baseline", "baseline_test80"), ("router mem", "eval_babyai_routermem"),
         ("force_mem", "eval_babyai_forcemem"), ("router SFT", "eval_babyai_routersftonly"),
         ("router both", "eval_babyai_routerboth"), ("force_sft", "eval_babyai_forcesft")]
-print("\n--- babyai (test split, 57 tasks) ---")
+print("\n--- babyai (test split, 80 tasks: layout seeds 20-21, all 40 levels x2) ---")
 for label, d in rows:
     path = os.path.join(OUT, d, "summary.json")
     if not os.path.exists(path):
@@ -255,6 +323,7 @@ for label, d in rows:
 PYR
 }
 
+phase_0
 phase_a
 phase_bc
 phase_d

@@ -87,7 +87,7 @@ def main() -> None:
         "--skip-sft-replay", action="store_true",
         help="don't replay+verify committed sft/both decisions (route counts and the memory bank still work without this)",
     )
-    parser.add_argument("--env-url", default="http://127.0.0.1:3100", help="BabyAI env server")
+    parser.add_argument("--env-url", default="http://127.0.0.1:36001", help="AgentGym BabyAI env server")
     parser.add_argument(
         "--run-eval", action="store_true",
         help="also score the resulting bank on --eval-split (first --eval-limit goals)",
@@ -99,14 +99,29 @@ def main() -> None:
     os.environ["BABYAI_ENV_URL"] = args.env_url  # read by the sft replay subprocesses
     from trajectory_memory_lab.babyai_agent import BabyAIEnvClient
 
-    rollout_world = read_json(args.train_rollout / "protocol.json")["env_world"]
-    server_seed = BabyAIEnvClient(args.env_url).info()["seed"]
-    if rollout_world["seed"] != server_seed:
-        raise SystemExit(
-            f"env server at {args.env_url} has world seed {server_seed}, but the train rollout "
-            f"was made with seed {rollout_world['seed']}: replays would run against a different world"
-        )
     trajectories = load_train_trajectories(args.train_rollout)
+
+    # Verify this server builds the SAME world the train rollout saw, because
+    # every sft replay is only meaningful against the identical layout.
+    # AgentGym exposes no /info and BabyAI has no server-level seed: `reset`
+    # constructs `BabyAI(all_levels[data_idx % 40 + 1], seed=data_idx // 40)`,
+    # so the world is a pure function of data_idx. The check is therefore an
+    # observation comparison -- reset one recorded task and require the first
+    # observation to match byte for byte -- which is strictly stronger than
+    # comparing a seed number would have been.
+    probe_task = sorted(trajectories)[0]
+    recorded = (trajectories[probe_task]["steps"][0]["content"] or "").strip()
+    env_probe = BabyAIEnvClient(args.env_url)
+    try:
+        live = (env_probe.reset(int(probe_task.rsplit("::", 1)[1])).get("observation") or "").strip()
+    finally:
+        env_probe.close()
+    if live != recorded:
+        raise SystemExit(
+            f"env server at {args.env_url} does not reproduce the train rollout's world: "
+            f"{probe_task} reset to a different observation.\n  recorded: {recorded[:200]!r}\n"
+            f"  live:     {live[:200]!r}"
+        )
     task_ids = sorted(trajectories)
     if args.limit > 0:
         task_ids = task_ids[: args.limit]

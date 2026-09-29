@@ -50,7 +50,29 @@ serve() {
   current=$(curl -s -m 5 "http://127.0.0.1:$port/v1/models" 2>/dev/null \
             | $PY -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["root"])' 2>/dev/null || true)
   if [[ "$current" == "$model" ]]; then log "serve: $port already on $(basename "$model")"; return 0; fi
-  tmux kill-session -t "$sess" 2>/dev/null; sleep 5
+  # Stop whatever actually holds this port, not just the session name this
+  # script would have used. Sessions from earlier benchmarks linger under
+  # their own names (tau2_srv_b was still serving 8031 here), so killing
+  # "$sess" alone leaves the old vLLM running and the identity check below
+  # then aborts on a server that was never replaced. This is the same
+  # wrong-session-name bug that silently CPU-offloaded six LoRA trainings
+  # on the tau2 run; fixing it only for GPUs was not enough.
+  tmux kill-session -t "$sess" 2>/dev/null
+  local holder
+  holder=$(ss -lptnH "sport = :$port" 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -1)
+  if [[ -n "${holder:-}" ]]; then
+    log "serve: port $port held by pid $holder; stopping it"
+    kill "$holder" 2>/dev/null
+  fi
+  for _ in $(seq 90); do
+    curl -s -m 3 "http://127.0.0.1:$port/v1/models" -o /dev/null 2>/dev/null || break
+    sleep 2
+  done
+  if curl -s -m 3 "http://127.0.0.1:$port/v1/models" -o /dev/null 2>/dev/null; then
+    log "ABORT: $port still serving after 180s; refusing to start a second server on it"
+    exit 1
+  fi
+  sleep 5
   log "serve: $port <- $(basename "$model") on GPU $gpus"
   tmux new-session -d -s "$sess" \
     "CUDA_VISIBLE_DEVICES=$gpus TENSOR_PARALLEL_SIZE=2 GPU_MEMORY_UTILIZATION=0.85 PORT=$port \
