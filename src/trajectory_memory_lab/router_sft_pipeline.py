@@ -65,6 +65,17 @@ _REPLAY_CONFIG = {
         "env_default": None,
         "extra_args": [],
     },
+    "textcraft": {
+        # Same shape as babyai: the env is a long-lived AgentGym server
+        # (agentenv-textcraft on :36002, the one process needing
+        # textcraft_venv), so the replay is just an HTTP client under .venv.
+        "python": str(ROOT / ".venv/bin/python"),
+        "script": "scripts/run_textcraft_guided_replay.py",
+        "agent_system": None,  # resolved lazily, same reason as the others
+        "env_var": None,       # server address comes from --env-url/$TEXTCRAFT_ENV_URL
+        "env_default": None,
+        "extra_args": [],
+    },
     "scienceworld": {
         "python": "/nas04/yixuh/scienceworld_venv/bin/python",
         "script": "scripts/run_scienceworld_guided_replay.py",
@@ -116,6 +127,10 @@ def _agent_system_for(domain: str) -> str:
         from .babyai_agent import AGENT_SYSTEM as BABYAI_AGENT_SYSTEM
 
         return BABYAI_AGENT_SYSTEM
+    if domain == "textcraft":
+        from .textcraft_agent import AGENT_SYSTEM as TEXTCRAFT_AGENT_SYSTEM
+
+        return TEXTCRAFT_AGENT_SYSTEM
     if domain == "webshop":
         from .webshop_agent import AGENT_SYSTEM as WEBSHOP_AGENT_SYSTEM
 

@@ -45,6 +45,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable
 
+from .agentgym_client import AgentGymEnvClient
 from .model_client import ModelClient
 
 DEFAULT_ENV_URL = "http://127.0.0.1:36001"
@@ -61,56 +62,17 @@ The list mixes low-level moves (`turn left`, `move forward`) with high-level one
 The episode ends as soon as the goal is satisfied. There is no explicit finish action."""
 
 
-class BabyAIEnvClient:
-    """Thin client for AgentGym's environment HTTP contract.
+class BabyAIEnvClient(AgentGymEnvClient):
+    """BabyAI's default port over the shared AgentGym contract.
 
-    Deliberately not BabyAI-specific: the same five endpoints back every
-    AgentGym environment, so the next one can reuse this class with a
-    different base URL.
+    The body of this class moved to `agentgym_client.AgentGymEnvClient`
+    unchanged when TextCraft became the second AgentGym environment here;
+    only the default URL is BabyAI-specific. Behaviour is identical, so the
+    BabyAI results already on disk remain comparable.
     """
 
     def __init__(self, base_url: str | None = None, timeout: float = 120.0) -> None:
-        # None means "take $BABYAI_ENV_URL, else the default port" -- the
-        # rollout runner passes the CLI flag straight through, and that flag
-        # defaults to None.
-        import os
-
-        resolved = base_url or os.environ.get("BABYAI_ENV_URL") or DEFAULT_ENV_URL
-        self.base_url = resolved.rstrip("/")
-        self.timeout = timeout
-        self.env_id: int | None = None
-
-    def _call(self, path: str, body: dict[str, Any] | None = None, method: str = "POST") -> dict[str, Any]:
-        url = f"{self.base_url}{path}"
-        data = json.dumps(body or {}).encode() if method == "POST" else None
-        request = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method=method,
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            payload = json.loads(response.read())
-        if isinstance(payload, dict) and "error" in payload:
-            raise RuntimeError(f"env server error on {path}: {payload['error']}")
-        return payload
-
-    def create(self) -> int:
-        self.env_id = int(self._call("/create")["id"])
-        return self.env_id
-
-    def reset(self, data_idx: int) -> dict[str, Any]:
-        if self.env_id is None:
-            self.create()
-        return self._call("/reset", {"id": self.env_id, "data_idx": data_idx})
-
-    def step(self, action: str) -> dict[str, Any]:
-        return self._call("/step", {"id": self.env_id, "action": action})
-
-    def close(self) -> None:
-        if self.env_id is not None:
-            try:
-                self._call("/close", {"id": self.env_id})
-            except Exception:  # noqa: BLE001 - closing is best effort
-                pass
-            self.env_id = None
+        super().__init__(base_url, timeout, env_var="BABYAI_ENV_URL", default_url=DEFAULT_ENV_URL)
 
 
 def split_task_ids(split: str, train_seeds: int = 20, test_seeds: int = 2) -> list[str]:

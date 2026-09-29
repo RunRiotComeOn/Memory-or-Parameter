@@ -239,6 +239,7 @@ _DOMAIN_WRITER_DESCRIPTION = {
     "alfworld": "a household-task agent operating in a text-adventure environment",
     "scienceworld": "a science-experiment agent operating in a text-adventure environment",
     "babyai": "a gridworld navigation agent operating in a text-described environment",
+    "textcraft": "a crafting agent decomposing a goal item into recipe subgoals in a text-described Minecraft world",
     "webshop": "a shopping agent operating a simulated web store",
     "tau2": "a customer-service agent following a written policy and calling tool APIs",
 }
@@ -249,6 +250,7 @@ _DOMAIN_SFT_WRITER = {
     "alfworld": ("alfworld_sft_writer", "ALFWORLD_SFT_WRITER_SYSTEM"),
     "scienceworld": ("scienceworld_sft_writer", "SCIENCEWORLD_SFT_WRITER_SYSTEM"),
     "babyai": ("babyai_sft_writer", "BABYAI_SFT_WRITER_SYSTEM"),
+    "textcraft": ("textcraft_sft_writer", "TEXTCRAFT_SFT_WRITER_SYSTEM"),
     "webshop": ("webshop_sft_writer", "WEBSHOP_SFT_WRITER_SYSTEM"),
     "tau2": ("tau2_sft_writer", "TAU2_SFT_WRITER_SYSTEM"),
 }
