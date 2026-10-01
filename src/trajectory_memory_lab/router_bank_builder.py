@@ -240,6 +240,7 @@ _DOMAIN_WRITER_DESCRIPTION = {
     "scienceworld": "a science-experiment agent operating in a text-adventure environment",
     "babyai": "a gridworld navigation agent operating in a text-described environment",
     "textcraft": "a crafting agent decomposing a goal item into recipe subgoals in a text-described Minecraft world",
+    "sqlgym": "a text-to-SQL agent answering questions against a real relational database it can query before answering",
     "webshop": "a shopping agent operating a simulated web store",
     "tau2": "a customer-service agent following a written policy and calling tool APIs",
 }
@@ -251,6 +252,7 @@ _DOMAIN_SFT_WRITER = {
     "scienceworld": ("scienceworld_sft_writer", "SCIENCEWORLD_SFT_WRITER_SYSTEM"),
     "babyai": ("babyai_sft_writer", "BABYAI_SFT_WRITER_SYSTEM"),
     "textcraft": ("textcraft_sft_writer", "TEXTCRAFT_SFT_WRITER_SYSTEM"),
+    "sqlgym": ("sqlgym_sft_writer", "SQLGYM_SFT_WRITER_SYSTEM"),
     "webshop": ("webshop_sft_writer", "WEBSHOP_SFT_WRITER_SYSTEM"),
     "tau2": ("tau2_sft_writer", "TAU2_SFT_WRITER_SYSTEM"),
 }

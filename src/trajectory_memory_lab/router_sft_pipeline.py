@@ -76,6 +76,17 @@ _REPLAY_CONFIG = {
         "env_default": None,
         "extra_args": [],
     },
+    "sqlgym": {
+        # sqlgym is a LIBRARY, not a server: the replay opens the SQLite
+        # databases in-process, so it needs sqlgym_venv rather than the
+        # repo .venv that the AgentGym-backed domains use.
+        "python": "/nas04/yixuh/sqlgym_venv/bin/python",
+        "script": "scripts/run_sqlgym_guided_replay.py",
+        "agent_system": None,  # resolved lazily, same reason as the others
+        "env_var": None,       # BIRD path comes from --bird-path
+        "env_default": None,
+        "extra_args": [],
+    },
     "scienceworld": {
         "python": "/nas04/yixuh/scienceworld_venv/bin/python",
         "script": "scripts/run_scienceworld_guided_replay.py",
@@ -131,6 +142,10 @@ def _agent_system_for(domain: str) -> str:
         from .textcraft_agent import AGENT_SYSTEM as TEXTCRAFT_AGENT_SYSTEM
 
         return TEXTCRAFT_AGENT_SYSTEM
+    if domain == "sqlgym":
+        from .sqlgym_agent import AGENT_SYSTEM as SQLGYM_AGENT_SYSTEM
+
+        return SQLGYM_AGENT_SYSTEM
     if domain == "webshop":
         from .webshop_agent import AGENT_SYSTEM as WEBSHOP_AGENT_SYSTEM
 
