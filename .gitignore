@@ -47,3 +47,6 @@ sqlgym_experiment/
 
 # Run logs anywhere in the tree (server, grid, chain logs) -- never source
 *.log
+
+# Run-time markers written by scripts/verify_gemini_merges.sh
+merge_verified/
