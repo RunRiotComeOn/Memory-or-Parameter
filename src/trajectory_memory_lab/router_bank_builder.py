@@ -506,6 +506,29 @@ def run_router_chain(
                 model=config.model, base_url=config.base_url, seed=config.seed + position,
             )
             logprob, entropy, probs = torch.zeros(()), torch.zeros(()), None
+        elif config.router_mode == "gemini":
+            # Same payload and the SAME system prompt as "llm" -- only which
+            # model reads it changes, so a difference is attributable to model
+            # identity rather than to a different decision interface. Zero
+            # tensors for the same reason the "llm" branch uses them.
+            from .router_gemini_policy import decide_route as gemini_decide_route
+
+            route, llm_rationale = gemini_decide_route(
+                trajectory, len(active_entries(bank)), recent_changes_text, draft_memory, draft_sft_plan,
+            )
+            logprob, entropy, probs = torch.zeros(()), torch.zeros(()), None
+        elif config.router_mode == "jev":
+            # Same payload and the same four option descriptions as "llm"
+            # (router_jev_policy imports both from router_llm_policy), but
+            # the decision comes from TypeSafe's Jev as a typed Choice rather
+            # than from generated text. Zero tensors for the same reason the
+            # "llm" branch uses them: this mode is not trained.
+            from .router_jev_policy import decide_route as jev_decide_route
+
+            route, llm_rationale = jev_decide_route(
+                trajectory, len(active_entries(bank)), recent_changes_text, draft_memory, draft_sft_plan,
+            )
+            logprob, entropy, probs = torch.zeros(()), torch.zeros(()), None
         else:
             features = features_of(trajectory, bank, recent_changes_text, draft_text)
             if greedy:

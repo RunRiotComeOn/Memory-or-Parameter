@@ -6,11 +6,13 @@ Builds one bank over `alfworld_experiment/base_train_v1`'s 40 train
 trajectories using `RouterBuilderConfig(router_mode="llm", domain="alfworld")`
 -- same model, same prompt, same payload builder as the AppWorld probe; only
 the writer's framing sentence changes (see `router_bank_builder.
-RouterBuilderConfig.domain`'s docstring). SFT drafting is skipped entirely
-for this domain (no ALFWorld teacher prompt or guided-replay script exists
-yet), so decisions can only ever land on `memory` or `neither` -- an `sft`/
-`both` pick would simply fail validation (`missing_plan`) and be recorded as
-such, not silently miscounted as a real SFT commit.
+RouterBuilderConfig.domain`'s docstring).
+
+(That paragraph used to say SFT drafting was skipped here because ALFWorld
+had no teacher prompt or guided-replay script. Both have existed since the
+v4 run -- `alfworld_sft_writer` and `scripts/run_alfworld_guided_replay.py`
+-- which is where `alfworld_summary.md`'s 21 verified SFT examples came
+from, so all four routes are live for this domain.)
 
 Reports the route distribution and, optionally, the real 57-task
 valid_unseen pass_rate for the resulting bank, directly comparable to
@@ -87,9 +89,14 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="0 = all 40 train tasks; >0 truncates for a quick look")
     parser.add_argument("--sft-writer", choices=("teacher", "self", "none"), default="teacher")
     parser.add_argument(
-        "--router-mode", choices=("llm", "force_memory", "force_sft"), default="llm",
-        help="'llm' = normal prompted routing (default); 'force_memory' = skip routing, every task commits its drafted memory unconditionally (ablation); "
-             "'force_sft' = the mirror ablation, every task commits its drafted sft plan and nothing ever reaches the memory bank",
+        "--router-mode", choices=("llm", "jev", "gemini", "force_memory", "force_sft"), default="llm",
+        help="'llm' = normal prompted routing (default); 'jev' = the same payload and the same four option "
+             "descriptions decided by TypeSafe's Jev as a typed Choice instead of generated text "
+             "(see router_jev_policy); 'gemini' = the same prompt and payload read by a cheap hosted "
+             "Gemini Flash model instead of the local task model (see router_gemini_policy); "
+             "'force_memory' = skip routing, every task commits its drafted memory "
+             "unconditionally (ablation); 'force_sft' = the mirror ablation, every task commits its drafted "
+             "sft plan and nothing ever reaches the memory bank",
     )
     parser.add_argument(
         "--skip-sft-replay", action="store_true",

@@ -38,10 +38,10 @@ set -uo pipefail
 cd /nas04/yixuh/memory
 export PYTHONPATH=src
 
-BASE=/nas04/yixuh/hf_cache/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754
+source scripts/lib_backbone.sh   # BASE, SERVED_NAME; MODEL_PROFILE selects the backbone
 PY=.venv/bin/python
 ROUTER_PY=/nas04/yixuh/router_venv/bin/python
-OUT=sqlgym_experiment
+OUT=$(backbone_out sqlgym_experiment); mkdir -p "$OUT"; export OUT
 DOM=sqlgym
 BIRD=/nas04/yixuh/bird           # fixed dataset on disk; no env server for this domain
 ROLL_PY=/nas04/yixuh/sqlgym_venv/bin/python   # the rollout opens SQLite itself
@@ -93,7 +93,7 @@ build_arm() {
   local dir="$OUT/${DOM}_${arm}"
   [[ -f "$dir/summary.json" ]] && { log "skip build $arm (done)"; return 0; }
   log "build $arm (mode=$mode writer=$writer)"
-  $PY -u scripts/run_sqlgym_router_llm_probe.py --output "$dir" \
+  $PY -u scripts/run_sqlgym_router_llm_probe.py --model "$SERVED_NAME" --output "$dir" \
       --train-rollout "$OUT/base_train_v1" --router-mode "$mode" \
       --sft-writer "$writer" --base-url "$url" --bird-path "$BIRD" \
     || { log "ABORT: build $arm failed"; return 1; }
@@ -132,7 +132,7 @@ train_and_merge() {
   local tag="${DOM}_${arm}"
   local pool="$OUT/${tag}/sft_pool.jsonl"
   local adapter="$OUT/${tag}_lora/adapter"
-  local merged="/nas04/yixuh/sq_${tag}_merged"
+  local merged="$(backbone_merged sq_${tag}_merged)"
   [[ -s "$pool" ]] || { log "skip $tag: empty or missing sft pool"; return 1; }
   local n; n=$(wc -l < "$pool")
   if [[ ! -f "$adapter/adapter_model.safetensors" ]]; then
@@ -143,7 +143,7 @@ train_and_merge() {
   else log "skip LoRA $tag (adapter exists)"; fi
   [[ -f "$adapter/adapter_model.safetensors" ]] || { log "FAIL: no adapter for $tag"; return 1; }
   if [[ ! -f "$adapter"_fullmodel/adapter_model.safetensors ]]; then
-    $ROUTER_PY scripts/rekey_lora_to_full_model.py "$adapter" "${adapter}_fullmodel" 2>&1 | tee -a "$OUT/${tag}_lora.log"
+    $ROUTER_PY scripts/rekey_lora_to_full_model.py "$adapter" "${adapter}_fullmodel" --base-model "$BASE" 2>&1 | tee -a "$OUT/${tag}_lora.log"
   fi
   if [[ ! -f "$merged/config.json" ]]; then
     log "merge $tag -> $merged"
@@ -152,18 +152,8 @@ train_and_merge() {
     for f in preprocessor_config.json video_preprocessor_config.json vocab.json merges.txt; do
       cp -L "$BASE/$f" "$merged/$f" 2>/dev/null
     done
-    $ROUTER_PY - "$BASE" "$merged" <<'PYV' 2>&1 | tee -a "$OUT/${tag}_merge.log"
-import json, os, sys
-from safetensors.torch import load_file
-B, M = sys.argv[1], sys.argv[2]
-bi = json.load(open(B + "/model.safetensors.index.json"))["weight_map"]
-mi = json.load(open(M + "/model.safetensors.index.json"))["weight_map"]
-for k, tag in (("model.language_model.layers.0.linear_attn.out_proj.weight", "target"),
-               ("model.visual.blocks.0.attn.qkv.weight", "untouched")):
-    a = load_file(os.path.join(B, bi[k]))[k].float()
-    b = load_file(os.path.join(M, mi[k]))[k].float()
-    print(f"  [{tag}] rel={float((a-b).norm()/a.norm()):.2e}")
-PYV
+    $ROUTER_PY scripts/verify_merged_model.py "$BASE" "$merged" "${adapter}_fullmodel" 2>&1 \
+      | tee -a "$OUT/${tag}_merge.log" || { log "ABORT: merged $tag failed verification"; exit 1; }
   else log "skip merge $tag (exists)"; fi
 }
 
@@ -203,7 +193,7 @@ eval_one() {
   local args=(--split "$split" --output "$dir" --experiment-name "sq_${split}_${name}"
               --bird-path "$BIRD"
               --max-parallel 6 --max-steps "$EVAL_STEPS" --seed 20260822
-              --model qwen35-tau --base-url "$url")
+              --model "$SERVED_NAME" --base-url "$url")
   if [[ -n "$bank" ]]; then
     # A wrong bank path does not stop the rollout: every task fails with
     # FileNotFoundError and a summary is still written, pass_rate null, which
@@ -227,7 +217,7 @@ phase_d() {
     done ) > "$OUT/phaseD_base.log" 2>&1 &
   local pid_base=$!
 
-  ( m="/nas04/yixuh/sq_${DOM}_router_probe_merged"
+  ( m="$(backbone_merged sq_${DOM}_router_probe_merged)"
     if [[ -f "$m/config.json" ]]; then
       serve sq_srv_b 4,5 8031 "$m"
       for split in test xdb; do
@@ -239,7 +229,7 @@ phase_d() {
   ) > "$OUT/phaseD_router.log" 2>&1 &
   local pid_router=$!
 
-  ( m="/nas04/yixuh/sq_${DOM}_force_sft_merged"
+  ( m="$(backbone_merged sq_${DOM}_force_sft_merged)"
     if [[ -f "$m/config.json" ]]; then
       serve sq_srv_c 6,7 8032 "$m"
       for split in test xdb; do
@@ -259,7 +249,7 @@ report() {
   log "=== RESULTS ==="
   $PY - <<'PYR'
 import json, os
-OUT = "sqlgym_experiment"
+OUT = os.environ["OUT"]
 rows = [("baseline", None), ("router mem", "routermem"), ("force_mem", "forcemem"),
         ("router SFT", "routersftonly"), ("router both", "routerboth"), ("force_sft", "forcesft")]
 for split, base_dir, n, label in (("test", "baseline_test80", 80, "same schemas, unseen questions"),

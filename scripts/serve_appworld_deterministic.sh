@@ -31,8 +31,13 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/appworld-det-server-cache}"
 # determinism comes from --max-num-seqs 1 within a replica, so independent
 # replicas parallelize without affecting it). Defaults are the original
 # single-replica TP=4 settings.
-exec "$project_root/.venv/bin/vllm" serve "$model_path" \
-  --served-model-name qwen35-tau \
+# Parsers, served name and vLLM build come from the checkpoint's model_type
+# (trajectory_memory_lab/model_profiles.py), so a merged checkpoint is served
+# exactly like its base and MODEL_PATH alone selects the backbone.
+eval "$(PYTHONPATH="$project_root/src" "$project_root/.venv/bin/python" \
+        -m trajectory_memory_lab.model_profiles serve-args "$model_path")"
+
+exec "$VLLM_BIN" serve "$model_path" \
   --host 127.0.0.1 \
   --port "${PORT:-8000}" \
   --tensor-parallel-size "${TENSOR_PARALLEL_SIZE:-4}" \
@@ -42,7 +47,4 @@ exec "$project_root/.venv/bin/vllm" serve "$model_path" \
   --enforce-eager \
   --max-num-seqs 1 \
   --no-enable-prefix-caching \
-  --reasoning-parser qwen3 \
-  --enable-auto-tool-choice \
-  --tool-call-parser qwen3_xml \
-  --language-model-only
+  "${PROFILE_SERVE_ARGS[@]}"

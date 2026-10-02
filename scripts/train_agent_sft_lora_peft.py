@@ -220,6 +220,7 @@ def _parsed_tool_arguments(messages: list[dict[str, Any]]) -> list[dict[str, Any
 
 def build_segment_examples(
     tokenizer, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, max_length: int,
+    turn_ends: tuple[str, ...] = (TURN_END,), implicit_stop: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """One pool row -> training sequences whose context for EVERY supervised
     assistant turn is byte-identical to the served prompt.
@@ -255,6 +256,21 @@ def build_segment_examples(
     Returns (sequences, dropped_over_max_length). A segment longer than
     `max_length` is dropped rather than truncated: cutting it would remove
     either the system turn or history the target depends on.
+
+    Other backbones (model_profiles.py), each measured on its template:
+
+    - `turn_ends`: the string(s) that close an assistant turn, supervised
+      as the stop. Qwen `<|im_end|>`, Gemma 4 `<turn|>`. GLM-4.7 has none --
+      a turn runs straight into the next role header, which is itself a
+      generation eos -- so its turn ends are the headers that can follow
+      (`<|user|>`, `<|observation|>`) and `implicit_stop` is appended at
+      the end of a segment, where no header follows in the rendering.
+    - Gemma 4 with thinking disabled puts an empty `<|channel>thought\n
+      <channel|>` in the GENERATION prompt only; history turns never carry
+      it, so the served prompt is not a prefix of any segment rendering.
+      Such a turn is spliced instead (`_spliced_turn`): its own sequence,
+      the served prompt verbatim followed by the turn as the template renders
+      it. Qwen and GLM never take this path.
     """
     prepared = _parsed_tool_arguments(messages)
 
@@ -274,21 +290,60 @@ def build_segment_examples(
         end = next((u for u in user_positions if u > index), len(prepared))
         segments.setdefault(end, []).append(index)
 
-    sequences, dropped = [], 0
+    def span_end(text: str, start: int, turn: int) -> int:
+        stops = [(i, t) for t in turn_ends if (i := text.find(t, start)) >= 0]
+        if not stops:
+            raise AssertionError(f"assistant turn {turn} has none of {turn_ends} in its rendering")
+        index, terminator = min(stops)
+        return index + len(terminator)
+
+    def _spliced_turn(turn: int, served: str) -> tuple[str, list[tuple[int, int]]]:
+        if prepared[turn].get("tool_calls"):
+            # Gemma 4 renders a tool-calling turn in history as call, tool
+            # response, THEN the turn's text -- not the order it was generated
+            # in -- so no rendering of it is what the model produced. Refuse
+            # rather than train on that.
+            raise NotImplementedError(
+                f"assistant turn {turn} calls tools and this template renders it differently in history "
+                "than at generation; tool-calling SFT pools (tau2) are not supported on this backbone"
+            )
+        full = render(prepared[: turn + 1], False)
+        if implicit_stop and not any(full.endswith(t) for t in turn_ends):
+            full += implicit_stop
+        common = 0
+        for a, b in zip(served, full):
+            if a != b:
+                break
+            common += 1
+        # The two renderings may differ only in the new turn's header: if they
+        # already diverge inside the history, splicing would train on a
+        # context that is neither the served prompt nor the template's.
+        history = render(prepared[:turn], False)
+        if common < len(history) or len(served) - common > 64:
+            raise AssertionError(
+                f"assistant turn {turn}: served prompt and template rendering diverge outside the turn header:\n"
+                f"  served  ...{served[-160:]!r}\n  rendered...{full[:len(served)][-160:]!r}"
+            )
+        text = served + full[common:]
+        return text, [(len(served), span_end(text, len(served), turn))]
+
+    pieces: list[tuple[str, list[tuple[int, int]]]] = []
     for end, turns in sorted(segments.items()):
         text = render(prepared[:end], False)
+        if implicit_stop and not any(text.endswith(t) for t in turn_ends):
+            text += implicit_stop
         spans = []
         for turn in turns:
             served = render(prepared[:turn], True)
             if not text.startswith(served):
-                raise AssertionError(
-                    f"served prompt for assistant turn {turn} is not a prefix of its segment rendering:\n"
-                    f"  served  ...{served[-160:]!r}\n  segment ...{text[:len(served)][-160:]!r}"
-                )
-            stop = text.find(TURN_END, len(served))
-            if stop < 0:
-                raise AssertionError(f"assistant turn {turn} has no {TURN_END} in its segment rendering")
-            spans.append((len(served), stop + len(TURN_END)))
+                pieces.append(_spliced_turn(turn, served))
+                continue
+            spans.append((len(served), span_end(text, len(served), turn)))
+        if spans:
+            pieces.append((text, spans))
+
+    sequences, dropped = [], 0
+    for text, spans in pieces:
         encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
         input_ids = encoded["input_ids"]
         if len(input_ids) > max_length:
@@ -304,7 +359,7 @@ def build_segment_examples(
 
 
 def chunked_causal_loss(
-    causal_lm, hidden: torch.Tensor, labels: torch.Tensor, chunk: int,
+    causal_lm, hidden: torch.Tensor, labels: torch.Tensor, chunk: int, softcap: float | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Sum of per-token cross-entropy, computed `chunk` positions at a time.
 
@@ -312,6 +367,11 @@ def chunked_causal_loss(
     so this is the same number -- and the same gradient -- as one big
     cross-entropy over the full sequence, at a fraction of the peak memory:
     only `chunk x vocab` logits are alive at a time instead of `seq x vocab`.
+
+    `softcap` is the model's `final_logit_softcapping` (Gemma 4: 30.0), which
+    its own forward applies after lm_head; calling lm_head directly, as this
+    does, would otherwise skip it and train against different logits than
+    the ones served.
     """
     shift_hidden = hidden[:, :-1, :]
     shift_labels = labels[:, 1:]
@@ -325,13 +385,39 @@ def chunked_causal_loss(
         if int((piece_labels != -100).sum()) == 0:
             continue
         logits = causal_lm.lm_head(piece_hidden).float()
+        if softcap:
+            logits = torch.tanh(logits / softcap) * softcap
+        # `.to(total.device)`: a tied lm_head (Gemma 4) sits with the input
+        # embedding on the FIRST card while the hidden state ends on the last,
+        # so the logits come back on a different device than `total`.
         total = total + torch.nn.functional.cross_entropy(
             logits.reshape(-1, logits.shape[-1]),
             piece_labels.reshape(-1).to(logits.device),
             ignore_index=-100,
             reduction="sum",
-        )
+        ).to(total.device)
     return total, supervised
+
+
+def keep_peft_targets_as_given() -> None:
+    """Stop PEFT from widening the LoRA onto fused MoE experts.
+
+    PEFT 0.21 under transformers v5 rewrites a LoRA config for some MoE
+    model types (`convert_peft_config_for_transformers`): any target ending
+    in `gate_proj`/`up_proj`/`down_proj`/`gate` -- including what "all-linear"
+    resolves to -- becomes a `target_parameters` entry on the fused 3D expert
+    tensors. It exists to load adapters trained under transformers v4. For
+    GLM-4.7-Flash it turned the r=8 all-linear adapter from ~11M into 337M
+    parameters, 326M of them on the 64 experts, which the Qwen3.5 recipe
+    (alfworld_summary.md: experts bit-identical after merge) never touches.
+    qwen3_5_moe has no such mapping, so for Qwen this changes nothing.
+    Called before both training and merging, so the two agree.
+    """
+    try:
+        from peft.utils import transformers_weight_conversion
+    except ImportError:
+        return
+    transformers_weight_conversion.convert_peft_config_for_transformers = lambda *args, **kwargs: None
 
 
 def main() -> None:
@@ -368,6 +454,15 @@ def main() -> None:
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from trajectory_memory_lab.model_profiles import profile_for_path
+
+    profile = profile_for_path(args.base_model)
+    turn_ends = profile.turn_ends
+    print(f"backbone profile: {profile.name} (turn ends {turn_ends}, implicit stop {profile.implicit_stop!r})",
+          flush=True)
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
@@ -393,7 +488,10 @@ def main() -> None:
             built.pop("text", None)
             groups.append([built])
             continue
-        sequences, dropped = build_segment_examples(tokenizer, messages, row.get("tools"), args.max_length)
+        sequences, dropped = build_segment_examples(
+            tokenizer, messages, row.get("tools"), args.max_length,
+            turn_ends=turn_ends, implicit_stop=profile.implicit_stop,
+        )
         dropped_segments += dropped
         if sequences:
             groups.append(sequences)
@@ -418,18 +516,37 @@ def main() -> None:
     )
     base.config.use_cache = False
     base.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    target_modules: str | list[str] = args.target_modules
+    if args.target_modules == "all-linear" and any(".language_model." in n for n, _ in base.named_modules()):
+        # Multimodal checkpoints that AutoModelForCausalLM loads whole (Gemma 4,
+        # unlike Qwen3.5, has no text-only class for its checkpoint): restrict
+        # "all-linear" to the language tower, which is all the agent ever runs
+        # (the servers pass --language-model-only). Full paths, so they are
+        # already the served architecture's and re-keying is a no-op.
+        target_modules = sorted(
+            n for n, m in base.named_modules()
+            if isinstance(m, torch.nn.Linear) and ".language_model." in n
+        )
+        print(f"  all-linear -> {len(target_modules)} language-tower Linear modules, e.g. {target_modules[0]}",
+              flush=True)
+    text_config = getattr(base.config, "text_config", None) or base.config
+    softcap = getattr(text_config, "final_logit_softcapping", None)
     lora = LoraConfig(
         r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.0,
-        target_modules=args.target_modules, bias="none", task_type="CAUSAL_LM",
+        target_modules=target_modules, bias="none", task_type="CAUSAL_LM",
     )
+    keep_peft_targets_as_given()
     model = get_peft_model(base, lora)
+    if getattr(model.peft_config["default"], "target_parameters", None):
+        raise SystemExit(f"LoRA unexpectedly targets parameters {model.peft_config['default'].target_parameters}")
     model.enable_input_require_grads()
     model.train()
     trainable = [p for p in model.parameters() if p.requires_grad]
     input_device = model.get_input_embeddings().weight.device
     causal_lm = model.get_base_model()
     print(f"  loaded in {time.time()-t0:.1f}s; {sum(p.numel() for p in trainable):,} trainable LoRA params; "
-          f"input_device={input_device} lm_head={causal_lm.lm_head.weight.device}", flush=True)
+          f"input_device={input_device} lm_head={causal_lm.lm_head.weight.device} logit_softcap={softcap}",
+          flush=True)
 
     optimizer = torch.optim.AdamW(trainable, lr=args.lr)
     steps_per_epoch = math.ceil(len(groups) / args.grad_accum)
@@ -457,7 +574,7 @@ def main() -> None:
                 input_ids = torch.tensor([example["input_ids"]], dtype=torch.long, device=input_device)
                 labels = torch.tensor([example["labels"]], dtype=torch.long, device=input_device)
                 hidden = causal_lm.model(input_ids=input_ids, use_cache=False).last_hidden_state
-                summed, _ = chunked_causal_loss(causal_lm, hidden, labels, args.loss_chunk)
+                summed, _ = chunked_causal_loss(causal_lm, hidden, labels, args.loss_chunk, softcap)
                 # Row-level token mean: each sequence contributes its summed
                 # loss over the row's total supervised tokens, so the row's
                 # gradient equals that of one sequence holding all its turns.

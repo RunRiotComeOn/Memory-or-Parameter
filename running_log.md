@@ -695,3 +695,46 @@ gemini      救回 8/15 = 53%
   对泛化/具体程度的要求跟 ALFWorld 的房间/物体操作任务不一样。**这依然是初步观察，不是定论**——
   两个benchmark目前都只有一次训练集内测量，方差未知，且 AppWorld 侧 DESIGN.md §13 已经量化过
   记忆内容本身价值方差极大（+30pp到-40pp）。
+
+## 19. 第二/第三个 backbone：Gemma 4 26B-A4B 与 GLM-4.7-Flash（2026-10-01，本机，兼容层已逐段实测）
+
+- **入口**：`MODEL_PROFILE=gemma4|glm47flash`（默认 `qwen35`，所有既有路径与行为不变）。
+  backbone 相关的一切集中在 `src/trajectory_memory_lab/model_profiles.py`；grid 脚本通过
+  `scripts/lib_backbone.sh` 取 `BASE` / `SERVED_NAME`，产物落到 `<benchmark>_experiment/<tag>/`、
+  merged 模型落到 `/nas04/yixuh/<tag>_*_merged`，所以新 backbone 不会因为 Qwen 的产物已存在而"跳过"。
+  ALFWorld 新增一键脚本 `scripts/run_alfworld_full_grid.sh`（基线→三臂→两 LoRA→merge→10 个评测，
+  同一批 train200/unseen57 task ids）；textcraft/sqlgym/babyai/tau2 的 full grid 也已接上 profile，
+  但它们的基线（`base_train_v1` 等）仍需按原方式先在 `<tag>/` 下跑。
+- **serving**：`serve_appworld_deterministic.sh` 按 checkpoint 的 `model_type` 自动选 vLLM 与 parser，
+  merged 模型因此与底座同配置。Gemma 4 需要 vLLM ≥0.19：`/nas04/yixuh/vllm019_venv`（vLLM 0.19.1 +
+  torch 2.10.0+cu128 + **transformers 钉在 5.5.4**）。实测踩坑：vLLM 0.30 自带 torch 2.13+cu130，
+  本机驱动只到 CUDA 12.6，worker 起不来；该 venv 里 pip 默认装的 transformers 5.18 与 vLLM 0.19.1
+  不兼容（`AmbiguousGlobalPerLayerAttributeError`）。Qwen 仍走原 `.venv`（vLLM 0.17.1），一字未动。
+- **served prompt 与训练文本逐 token 一致**（`/tokenize` 对比 HF 模板，首/中/末轮全部 identical）。
+  Gemma 必须加 `--chat-template-content-format string`：vLLM 自动判成 openai 格式后，system 轮末尾会
+  多渲染一个空格（`it. <turn|>`），差 1 个 token。
+- **SFT 训练器**（`train_agent_sft_lora_peft.py`）三处按模型区分，均实测：
+  - turn 结束符：Qwen `<|im_end|>`、Gemma `<turn|>`；GLM 模板没有结束符，assistant 内容直接接下一个
+    role header，所以监督到后面的 `<|user|>`/`<|observation|>`（都在其 generation eos 里），段末补 `<|user|>`。
+    merged GLM 实测 `finish=stop`、回复 ≤29 字符，停得住。
+  - Gemma 关 thinking 时生成提示末尾带空的 `<|channel>thought\n<channel|>`，历史轮里没有，所以 served
+    prompt 不是分段渲染的前缀：这类轮改为"served prompt 原样 + 该轮渲染"单独成序列。Gemma 的工具调用轮
+    在历史里被重排（call → response → 正文），无法精确复现，**tau2 SFT 在 gemma4 上明确拒绝**
+    （grid 开头就 abort）。
+  - Gemma `final_logit_softcapping=30` 在分块 loss 里补上；Gemma 的 tied lm_head 与输入嵌入同卡，
+    loss 跨卡相加需 `.to(total.device)`。
+  - Qwen 路径回归：181 条 ALFWorld pool + 5 条 tau2 pool 生成的序列与改动前**逐字节相同**。
+- **LoRA 范围对齐 Qwen**：PEFT 0.21 在 transformers v5 下会把 GLM 的 all-linear 自动扩到融合 MoE 专家
+  （`target_parameters`），可训练参数 11M→337M（326M 在专家上）。训练与 merge 都关掉这个转换，
+  GLM 回到 14.8M、Gemma 10.0M（Qwen 11.2M）。Gemma 的 `AutoModelForCausalLM` 会载入整个多模态模型，
+  all-linear 限定到 `language_model` 下的 235 个 Linear。
+- **merge**：re-key 从底座 index 自动判断插入段（Qwen `language_model.`，另两个为空；Qwen 结果与旧
+  adapter 逐字节相同）。merged 目录的 `config.json`/`generation_config.json`/tokenizer/模板一律从底座原样
+  拷贝：transformers 5.17 重存的 Gemma config（`per_layer_config`、vision `rope_type: axial`）在
+  vLLM 侧 5.5.4 里加载失败。Qwen merged + 底座 config 已在 vLLM 0.17.1 上实测可服务。
+  `scripts/verify_merged_model.py` 取代各 grid 里写死 Qwen 键名的 heredoc，失败即 abort：
+  目标层必须变、embedding/vision/专家必须逐位不变、merged 不得出现底座没有的权重名。
+- **小样本行为（不是结论）**：unseen57 前 6 题（同一房间的 look_at_obj_in_light）Qwen 6/6，Gemma、GLM
+  均 1/6，失败模式相同：开灯前不拿物体，temperature 0 下 `look`/`examine` 循环。只说明这类任务难，
+  不代表整体水平；基线以 full grid 的 phase 0 为准。ALFWorld 逐题确定性只在 Qwen 上验证过，
+  新 backbone 换副本比较前需重测。

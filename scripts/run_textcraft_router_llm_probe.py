@@ -82,8 +82,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="0 = every train task in the rollout; >0 truncates for a quick look")
     parser.add_argument("--sft-writer", choices=("teacher", "self", "none"), default="teacher")
     parser.add_argument(
-        "--router-mode", choices=("llm", "force_memory", "force_sft"), default="llm",
-        help="'llm' = normal prompted routing (default); 'force_memory' = skip routing, every task commits its drafted memory unconditionally (ablation); "
+        "--router-mode", choices=("llm", "gemini", "force_memory", "force_sft"), default="llm",
+        help="'llm' = normal prompted routing (default); 'gemini' = the same prompt and payload read by a cheap hosted Gemini Flash model instead of the local task model (see router_gemini_policy); 'force_memory' = skip routing, every task commits its drafted memory unconditionally (ablation); "
              "'force_sft' = the mirror ablation, every task commits its drafted sft plan and nothing ever reaches the memory bank",
     )
     parser.add_argument(

@@ -25,6 +25,13 @@ Two things are rewritten here:
   inside its 27-block vision tower and its MTP head (461 nn.Linear vs the
   language tower's 351), so suffix matching would attach fresh adapters to
   modules the training never saw and the state dict has no weights for.
+
+With `--base-model`, the path segment to insert is not assumed but found:
+the one (of `language_model.` and nothing) under which every trained module
+has a `.weight` in the base checkpoint's index. Qwen3.5 needs the insert;
+GLM-4.7-Flash is text-only and Gemma 4 is trained on its full architecture
+(see train_agent_sft_lora_peft.py), so for those it is empty and only the
+explicit `target_modules` are written.
 """
 
 from __future__ import annotations
@@ -41,18 +48,36 @@ NEW_PREFIX = "base_model.model.model.language_model."
 PEFT_WRAPPER = "base_model.model."
 
 
+def detect_insert(tensors: dict, base_model: Path) -> str:
+    weights = set(json.loads((base_model / "model.safetensors.index.json").read_text())["weight_map"])
+    modules = {k[len(PEFT_WRAPPER):].rsplit(".lora_", 1)[0] for k in tensors if ".lora_" in k}
+    for insert in ("", "language_model."):
+        paths = {m.replace("model.", "model." + insert, 1) for m in modules}
+        if all(p + ".weight" in weights for p in paths):
+            print(f"insert detected from {base_model.name}'s index: {insert!r}")
+            return insert
+    example = sorted(modules)[0]
+    raise SystemExit(f"no insert puts every trained module in {base_model}'s index (e.g. {example!r})")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("adapter", type=Path, help="adapter dir trained on AutoModelForCausalLM")
     parser.add_argument("output", type=Path, help="re-keyed adapter dir for the full architecture")
-    parser.add_argument("--insert", default="language_model.",
-                        help="path segment to insert after the base model prefix")
+    parser.add_argument("--insert", default=None,
+                        help="path segment to insert after the base model prefix "
+                             "(default: detected from --base-model, else 'language_model.')")
+    parser.add_argument("--base-model", type=Path, default=None,
+                        help="base checkpoint dir; its weight index decides --insert")
     args = parser.parse_args()
 
     tensors = load_file(str(args.adapter / "adapter_model.safetensors"))
+    insert = args.insert
+    if insert is None:
+        insert = "language_model." if args.base_model is None else detect_insert(tensors, args.base_model)
     old_prefix = OLD_PREFIX
-    new_prefix = OLD_PREFIX + args.insert
-    if any(k.startswith(new_prefix) for k in tensors):
+    new_prefix = OLD_PREFIX + insert
+    if insert and any(k.startswith(new_prefix) for k in tensors):
         raise SystemExit(f"adapter already targets {new_prefix!r}; nothing to do")
     missing = [k for k in tensors if not k.startswith(old_prefix)]
     if missing:

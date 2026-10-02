@@ -31,11 +31,16 @@ set -uo pipefail
 cd /nas04/yixuh/memory
 export PYTHONPATH=src
 
-BASE=/nas04/yixuh/hf_cache/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754
+source scripts/lib_backbone.sh   # BASE, SERVED_NAME; MODEL_PROFILE selects the backbone
+# Gemma 4's template renders a tool-calling turn differently in history than
+# at generation, so its tau2 SFT pools cannot be trained exactly
+# (train_agent_sft_lora_peft._spliced_turn refuses). Stop before phase A
+# spends hours on builds whose LoRA step would then fail.
+[[ "$MODEL_PROFILE" == "gemma4" ]] && { echo "ABORT: tau2 SFT arms are not supported on gemma4"; exit 1; }
 PY=.venv/bin/python
 TAU2_PY=third_party/tau2-bench/.venv/bin/python
 ROUTER_PY=/nas04/yixuh/router_venv/bin/python
-OUT=tau2_experiment
+OUT=$(backbone_out tau2_experiment); mkdir -p "$OUT"; export OUT
 DOMAINS=(retail telecom airline)
 KEEP_MERGED="${KEEP_MERGED:-0}"   # set to 1 to keep the 66GB merged models
 
@@ -95,7 +100,7 @@ build_arm() {
   local dir="$OUT/${dom}_${arm}"
   [[ -f "$dir/summary.json" ]] && { log "skip build $dom/$arm (done)"; return 0; }
   log "build $dom/$arm (mode=$mode writer=$writer)"
-  $PY -u scripts/run_tau2_router_llm_probe.py --domain "$dom" --output "$dir" \
+  $PY -u scripts/run_tau2_router_llm_probe.py --model "$SERVED_NAME" --domain "$dom" --output "$dir" \
       --train-rollout "$OUT/${dom}_base_train" --router-mode "$mode" \
       --sft-writer "$writer" --base-url "$url"
 }
@@ -127,7 +132,7 @@ train_and_merge() {
   local tag="${dom}_${arm}"
   local pool="$OUT/${tag}/sft_pool.jsonl"
   local adapter="$OUT/${tag}_lora/adapter"
-  local merged="/nas04/yixuh/t2_${tag}_merged"
+  local merged="$(backbone_merged t2_${tag}_merged)"
   [[ -s "$pool" ]] || { log "skip $tag: empty or missing sft pool"; return 1; }
   local n; n=$(wc -l < "$pool")
   if [[ ! -f "$adapter/adapter_model.safetensors" ]]; then
@@ -138,7 +143,7 @@ train_and_merge() {
   else log "skip LoRA $tag (adapter exists)"; fi
   [[ -f "$adapter/adapter_model.safetensors" ]] || { log "FAIL: no adapter for $tag"; return 1; }
   if [[ ! -f "$adapter"_fullmodel/adapter_model.safetensors ]]; then
-    $ROUTER_PY scripts/rekey_lora_to_full_model.py "$adapter" "${adapter}_fullmodel" 2>&1 | tee -a "$OUT/${tag}_lora.log"
+    $ROUTER_PY scripts/rekey_lora_to_full_model.py "$adapter" "${adapter}_fullmodel" --base-model "$BASE" 2>&1 | tee -a "$OUT/${tag}_lora.log"
   fi
   if [[ ! -f "$merged/config.json" ]]; then
     log "merge $tag -> $merged"
@@ -147,18 +152,8 @@ train_and_merge() {
     for f in preprocessor_config.json video_preprocessor_config.json vocab.json merges.txt; do
       cp -L "$BASE/$f" "$merged/$f" 2>/dev/null
     done
-    $ROUTER_PY - "$BASE" "$merged" <<'PYV' 2>&1 | tee -a "$OUT/${tag}_merge.log"
-import json, os, sys
-from safetensors.torch import load_file
-B, M = sys.argv[1], sys.argv[2]
-bi = json.load(open(B + "/model.safetensors.index.json"))["weight_map"]
-mi = json.load(open(M + "/model.safetensors.index.json"))["weight_map"]
-for k, tag in (("model.language_model.layers.0.linear_attn.out_proj.weight", "target"),
-               ("model.visual.blocks.0.attn.qkv.weight", "untouched")):
-    a = load_file(os.path.join(B, bi[k]))[k].float()
-    b = load_file(os.path.join(M, mi[k]))[k].float()
-    print(f"  [{tag}] rel={float((a-b).norm()/a.norm()):.2e}")
-PYV
+    $ROUTER_PY scripts/verify_merged_model.py "$BASE" "$merged" "${adapter}_fullmodel" 2>&1 \
+      | tee -a "$OUT/${tag}_merge.log" || { log "ABORT: merged $tag failed verification"; exit 1; }
   else log "skip merge $tag (exists)"; fi
 }
 
@@ -205,7 +200,7 @@ eval_one() {
   fi
   local args=(--domain "$dom" --split test --output "$dir"
               --max-parallel 4 --max-steps 200 --seed 20260822
-              --model qwen35-tau --base-url "$url")
+              --model "$SERVED_NAME" --base-url "$url")
   if [[ -n "$bank" ]]; then
     # A wrong bank path does not stop the rollout: every task fails with
     # FileNotFoundError and the run still writes a summary, with pass_rate
@@ -233,7 +228,7 @@ phase_d() {
 
   # per-domain merged models, on replicas B (router) and C (force_sft)
   ( for dom in "${DOMAINS[@]}"; do
-      m="/nas04/yixuh/t2_${dom}_router_probe_merged"
+      m="$(backbone_merged t2_${dom}_router_probe_merged)"
       [[ -f "$m/config.json" ]] || { log "skip $dom router evals (no merged model)"; continue; }
       serve tau2_srv_b 4,5 8031 "$m"
       eval_one routersftonly "$dom" http://127.0.0.1:8031/v1
@@ -243,7 +238,7 @@ phase_d() {
   local pid_router=$!
 
   ( for dom in "${DOMAINS[@]}"; do
-      m="/nas04/yixuh/t2_${dom}_force_sft_merged"
+      m="$(backbone_merged t2_${dom}_force_sft_merged)"
       [[ -f "$m/config.json" ]] || { log "skip $dom force_sft eval (no merged model)"; continue; }
       serve tau2_srv_c 6,7 8032 "$m"
       eval_one forcesft "$dom" http://127.0.0.1:8032/v1
@@ -261,7 +256,7 @@ report() {
   log "=== RESULTS ==="
   $PY - <<'PYR'
 import json, glob, os
-OUT = "tau2_experiment"
+OUT = os.environ["OUT"]
 rows = [("baseline", "{d}_baseline_test"), ("router mem", "eval_{d}_routermem"),
         ("force_mem", "eval_{d}_forcemem"), ("router SFT", "eval_{d}_routersftonly"),
         ("router both", "eval_{d}_routerboth"), ("force_sft", "eval_{d}_forcesft")]

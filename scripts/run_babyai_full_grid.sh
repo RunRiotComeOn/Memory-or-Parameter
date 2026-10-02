@@ -34,11 +34,11 @@ set -uo pipefail
 cd /nas04/yixuh/memory
 export PYTHONPATH=src
 
-BASE=/nas04/yixuh/hf_cache/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/59d61f3ce65a6d9863b86d2e96597125219dc754
+source scripts/lib_backbone.sh   # BASE, SERVED_NAME; MODEL_PROFILE selects the backbone
 PY=.venv/bin/python
 BENCH_PY=.venv/bin/python
 ROUTER_PY=/nas04/yixuh/router_venv/bin/python
-OUT=babyai_experiment
+OUT=$(backbone_out babyai_experiment); mkdir -p "$OUT"; export OUT
 DOM=babyai
 ENV_URL=http://127.0.0.1:36001   # AgentGym babyai env server (tmux: babyai_env)
 # The held-out set is every task with layout seed 20-21, i.e. all forty levels
@@ -107,7 +107,7 @@ phase_0() {
   $BENCH_PY -u scripts/run_babyai_rollout.py --split test --output "$dir" \
       --experiment-name babyai_baseline_test80 --env-url "$ENV_URL" \
       --max-parallel 4 --max-steps "$EVAL_STEPS" --seed 20260822 \
-      --model qwen35-tau --base-url http://127.0.0.1:8030/v1 \
+      --model "$SERVED_NAME" --base-url http://127.0.0.1:8030/v1 \
       > "$OUT/baseline_test80.log" 2>&1 \
     || { log "ABORT: baseline rollout failed (see $OUT/baseline_test80.log)"; exit 1; }
   log "=== PHASE 0 done ==="
@@ -122,7 +122,7 @@ build_arm() {
   # No --domain: BabyAI is a single domain and its probe script has no such
   # flag (tau2's does, and the leftover argument silently failed all three
   # arms here with an argparse usage error).
-  $PY -u scripts/run_babyai_router_llm_probe.py --output "$dir" \
+  $PY -u scripts/run_babyai_router_llm_probe.py --model "$SERVED_NAME" --output "$dir" \
       --train-rollout "$OUT/base_train_v1" --router-mode "$mode" \
       --sft-writer "$writer" --base-url "$url" --env-url "$ENV_URL" || {
     log "ABORT: build $dom/$arm failed"; return 1; }
@@ -168,7 +168,7 @@ train_and_merge() {
   local tag="${dom}_${arm}"
   local pool="$OUT/${tag}/sft_pool.jsonl"
   local adapter="$OUT/${tag}_lora/adapter"
-  local merged="/nas04/yixuh/ba_${tag}_merged"
+  local merged="$(backbone_merged ba_${tag}_merged)"
   [[ -s "$pool" ]] || { log "skip $tag: empty or missing sft pool"; return 1; }
   local n; n=$(wc -l < "$pool")
   if [[ ! -f "$adapter/adapter_model.safetensors" ]]; then
@@ -179,7 +179,7 @@ train_and_merge() {
   else log "skip LoRA $tag (adapter exists)"; fi
   [[ -f "$adapter/adapter_model.safetensors" ]] || { log "FAIL: no adapter for $tag"; return 1; }
   if [[ ! -f "$adapter"_fullmodel/adapter_model.safetensors ]]; then
-    $ROUTER_PY scripts/rekey_lora_to_full_model.py "$adapter" "${adapter}_fullmodel" 2>&1 | tee -a "$OUT/${tag}_lora.log"
+    $ROUTER_PY scripts/rekey_lora_to_full_model.py "$adapter" "${adapter}_fullmodel" --base-model "$BASE" 2>&1 | tee -a "$OUT/${tag}_lora.log"
   fi
   if [[ ! -f "$merged/config.json" ]]; then
     log "merge $tag -> $merged"
@@ -188,18 +188,8 @@ train_and_merge() {
     for f in preprocessor_config.json video_preprocessor_config.json vocab.json merges.txt; do
       cp -L "$BASE/$f" "$merged/$f" 2>/dev/null
     done
-    $ROUTER_PY - "$BASE" "$merged" <<'PYV' 2>&1 | tee -a "$OUT/${tag}_merge.log"
-import json, os, sys
-from safetensors.torch import load_file
-B, M = sys.argv[1], sys.argv[2]
-bi = json.load(open(B + "/model.safetensors.index.json"))["weight_map"]
-mi = json.load(open(M + "/model.safetensors.index.json"))["weight_map"]
-for k, tag in (("model.language_model.layers.0.linear_attn.out_proj.weight", "target"),
-               ("model.visual.blocks.0.attn.qkv.weight", "untouched")):
-    a = load_file(os.path.join(B, bi[k]))[k].float()
-    b = load_file(os.path.join(M, mi[k]))[k].float()
-    print(f"  [{tag}] rel={float((a-b).norm()/a.norm()):.2e}")
-PYV
+    $ROUTER_PY scripts/verify_merged_model.py "$BASE" "$merged" "${adapter}_fullmodel" 2>&1 \
+      | tee -a "$OUT/${tag}_merge.log" || { log "ABORT: merged $tag failed verification"; exit 1; }
   else log "skip merge $tag (exists)"; fi
 }
 
@@ -251,7 +241,7 @@ eval_one() {
   local args=(--split test --output "$dir" --experiment-name "babyai_${name}"
               --env-url "$ENV_URL"
               --max-parallel 4 --max-steps "$EVAL_STEPS" --seed 20260822
-              --model qwen35-tau --base-url "$url")
+              --model "$SERVED_NAME" --base-url "$url")
   if [[ -n "$bank" ]]; then
     # A wrong bank path does not stop the rollout: every task fails with
     # FileNotFoundError and the run still writes a summary, with pass_rate
@@ -279,7 +269,7 @@ phase_d() {
 
   # per-domain merged models, on replicas B (router) and C (force_sft)
   ( for dom in "$DOM"; do
-      m="/nas04/yixuh/ba_${dom}_router_probe_merged"
+      m="$(backbone_merged ba_${dom}_router_probe_merged)"
       [[ -f "$m/config.json" ]] || { log "skip $dom router evals (no merged model)"; continue; }
       serve ba_srv_b 4,5 8031 "$m"
       eval_one routersftonly "$dom" http://127.0.0.1:8031/v1
@@ -289,7 +279,7 @@ phase_d() {
   local pid_router=$!
 
   ( for dom in "$DOM"; do
-      m="/nas04/yixuh/ba_${dom}_force_sft_merged"
+      m="$(backbone_merged ba_${dom}_force_sft_merged)"
       [[ -f "$m/config.json" ]] || { log "skip $dom force_sft eval (no merged model)"; continue; }
       serve ba_srv_c 6,7 8032 "$m"
       eval_one forcesft "$dom" http://127.0.0.1:8032/v1
@@ -307,7 +297,7 @@ report() {
   log "=== RESULTS ==="
   $PY - <<'PYR'
 import json, os
-OUT = "babyai_experiment"
+OUT = os.environ["OUT"]
 rows = [("baseline", "baseline_test80"), ("router mem", "eval_babyai_routermem"),
         ("force_mem", "eval_babyai_forcemem"), ("router SFT", "eval_babyai_routersftonly"),
         ("router both", "eval_babyai_routerboth"), ("force_sft", "eval_babyai_forcesft")]

@@ -1,0 +1,3 @@
+2026-10-01 20:58 verified before the driver deleted /nas04/yixuh/gem_babyai_merged
+  [target]    layers.0.linear_attn.in_proj_a.weight rel=2.00e-03 ok
+  [untouched] embed_tokens / visual.blocks.0 / experts.down_proj rel=0.00e+00 ok
